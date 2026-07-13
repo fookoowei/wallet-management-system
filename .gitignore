@@ -1,0 +1,23 @@
+# Dependencies — reinstalled from package.json via `npm install`, never committed
+node_modules/
+
+# Build output — generated from source by `nest build`, not source itself
+dist/
+build/
+
+# Secrets & local environment — NEVER commit real credentials
+.env
+.env.*
+!.env.example
+
+# Test coverage reports — generated artifacts
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+*.swp
