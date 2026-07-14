@@ -1,0 +1,41 @@
+// Prisma schema — the single source of truth for your database structure.
+// Change this file, run a migration, and Prisma updates the DB + regenerates the typed client.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  firstName    String
+  lastName     String
+  status       String   @default("active") // active | suspended
+  role         Role     @relation(fields: [roleId], references: [id])
+  roleId       String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([roleId])
+}
+
+model Role {
+  id          String       @id @default(uuid())
+  name        String       @unique // super_admin | admin | finance | support | user
+  description String?
+  permissions Permission[] @relation("PermissionToRole")
+  users       User[]
+}
+
+model Permission {
+  id          String  @id @default(uuid())
+  code        String  @unique // e.g. withdrawal.approve
+  description String?
+  roles       Role[]  @relation("PermissionToRole")
+}
