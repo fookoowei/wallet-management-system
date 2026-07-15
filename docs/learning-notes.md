@@ -102,3 +102,15 @@ Careful command: `docker compose down -v` — the `-v` deletes the volume (wipes
 - We are **not** using Redis. Core wallet features (ledger, RBAC, auth, audit) work with **PostgreSQL only**; financial correctness lives in the DB, not a cache.
 - Redis is a fast in-memory store used for caching, session/token denylists, rate limiting, or background job queues.
 - **Possible future/stretch use:** rate-limiting login attempts, or a job queue for async transaction processing. A good "how would you scale this?" talking point — added later, never a prerequisite.
+
+---
+
+## TDD (Test-Driven Development) & mocking
+
+- The loop: **Red → Green → Refactor.**
+  1. **Red** — write the test *first*, run it, watch it fail (proves the test actually checks something).
+  2. **Green** — write the minimum code to make it pass.
+  3. **Refactor** — clean up, keep the test passing.
+- **Mocking** — in a unit test, replace a real dependency with a fake. For `HealthService` we injected a fake `PrismaService` whose `$queryRaw` just *pretends* to succeed or fail — so the test needs no real database. Fast, isolated, deterministic.
+- **This only works because of DI:** the service *receives* `PrismaService` in its constructor, so a test can hand it a fake instead of the real one.
+- **Controller vs Service:** the *service* holds logic (and is unit-tested); the *controller* just maps an HTTP route (`GET /health`) to a service call.
