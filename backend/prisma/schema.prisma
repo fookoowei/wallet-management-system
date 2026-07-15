@@ -19,6 +19,7 @@ model User {
   status       String   @default("active") // active | suspended
   role         Role     @relation(fields: [roleId], references: [id])
   roleId       String
+  refreshTokens RefreshToken[]
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -38,4 +39,15 @@ model Permission {
   code        String  @unique // e.g. withdrawal.approve
   description String?
   roles       Role[]  @relation("PermissionToRole")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  tokenHash String   @unique // SHA-256 hex of the raw refresh token (never the raw token)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
 }
