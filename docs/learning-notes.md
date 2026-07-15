@@ -114,3 +114,22 @@ Careful command: `docker compose down -v` — the `-v` deletes the volume (wipes
 - **Mocking** — in a unit test, replace a real dependency with a fake. For `HealthService` we injected a fake `PrismaService` whose `$queryRaw` just *pretends* to succeed or fail — so the test needs no real database. Fast, isolated, deterministic.
 - **This only works because of DI:** the service *receives* `PrismaService` in its constructor, so a test can hand it a fake instead of the real one.
 - **Controller vs Service:** the *service* holds logic (and is unit-tested); the *controller* just maps an HTTP route (`GET /health`) to a service call.
+
+---
+
+## DTOs & request validation
+
+- A **DTO** (Data Transfer Object) is a small class describing the *shape* of an incoming request body — e.g. `RegisterDto` has `email`, `password`, `firstName`, `lastName`.
+- **Decorators** like `@IsEmail()` / `@MinLength(8)` (from `class-validator`) declare the rules right on the fields.
+- The global **`ValidationPipe`** (turned on once in `main.ts`) reads those rules on every request and auto-rejects bad bodies with a `400` — so controllers never see garbage input.
+  - `whitelist: true` → strips any field the DTO didn't declare (stops a caller sneaking in `role: "super_admin"`).
+  - `transform: true` → turns the raw JSON into a real DTO instance, which is what makes the decorators actually run.
+- **Why:** validation lives in one declarative place, not scattered `if` checks; the door is guarded before any business logic runs.
+
+---
+
+## Returning data safely (don't leak secrets)
+
+- Never return the `passwordHash` (or other secrets) to the client. In `register()` we strip it with destructuring:
+  `const { passwordHash: _passwordHash, ...safeUser } = user;` → `safeUser` has everything *except* the hash.
+- **HTTP status via exceptions:** throwing `ConflictException` → `409`, `UnauthorizedException` → `401`, etc. NestJS maps the exception type to the right status code automatically.
