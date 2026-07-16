@@ -5,6 +5,11 @@ import { TokensService } from './tokens.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 
+// Precomputed once at startup. When an email doesn't exist we still run one
+// bcrypt.compare against this dummy hash, so login takes ~constant time and
+// can't be used as a timing oracle to discover which emails have accounts.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync('a-non-matching-dummy-password', 10);
+
 @Injectable()
 export class AuthService {
   constructor(
@@ -42,8 +47,12 @@ export class AuthService {
 
     // Same vague failure for "no such email" AND "wrong password" — this denies
     // an attacker any signal about which emails have accounts (user enumeration).
-    const passwordMatches = user && (await bcrypt.compare(dto.password, user.passwordHash));
-    if (!passwordMatches) throw new UnauthorizedException('Invalid credentials');
+    // Always run one bcrypt.compare (dummy hash if no user) to keep timing constant.
+    const passwordMatches = await bcrypt.compare(
+      dto.password,
+      user?.passwordHash ?? DUMMY_PASSWORD_HASH,
+    );
+    if (!user || !passwordMatches) throw new UnauthorizedException('Invalid credentials');
 
     return this.tokens.issueTokens(user);
   }

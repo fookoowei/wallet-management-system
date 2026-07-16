@@ -14,7 +14,9 @@ import { JwtStrategy } from './jwt.strategy';
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
-        secret: config.get<string>('JWT_ACCESS_SECRET'),
+        // getOrThrow: crash at boot if the secret is unset, never sign with undefined
+        // (matches how JwtStrategy reads the same secret for verification).
+        secret: config.getOrThrow<string>('JWT_ACCESS_SECRET'),
         signOptions: { expiresIn: '15m' },
       }),
     }),

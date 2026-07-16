@@ -183,3 +183,34 @@ When the 15-min access token expires, the client sends its **refresh token** to 
 **Why `POST` for logout, and 204?** Logout *changes server state* (deletes a row), so it's not a `GET`. There's nothing meaningful to return, so we reply `204 No Content`.
 
 **Known limitation (future hardening):** we do plain single-use rotation. A stronger design adds **token families / reuse detection** — if a token that was *already rotated away* is presented, treat it as theft and revoke the user's whole family of tokens. Clean stretch enhancement; not built yet.
+
+---
+
+## 🔑 Milestone 2 recap — authentication, end to end
+
+The whole auth surface, and how a session lives and dies:
+
+| Endpoint | Guard? | What it does |
+|---|---|---|
+| `POST /auth/register` | no | Create an account (bcrypt-hashed password, default `user` role). Returns the user *without* the hash. |
+| `POST /auth/login` | no | Verify email + password → return `{ accessToken, refreshToken }`. |
+| `POST /auth/refresh` | no* | Exchange a valid refresh token for a fresh pair (old one is burned). |
+| `POST /auth/logout` | no* | Revoke (delete) a refresh token → `204`. |
+| `GET /auth/me` | **yes** | Return the caller's identity from their access token. |
+
+\* `/refresh` and `/logout` aren't behind the JWT guard on purpose — you use them precisely when the access token is expired/gone. They authenticate via the *refresh token in the body*, not the access-token header.
+
+**The session lifecycle:**
+1. **Login** → server signs a 15-min access JWT and stores a hashed 7-day refresh-token row. Client holds both.
+2. **Every request** → client sends `Authorization: Bearer <access>`. `JwtStrategy` verifies the signature + expiry (no DB) and populates `request.user`.
+3. **Access token expires (~15 min)** → next request `401`s. Client calls `/refresh` with its refresh token → gets a new pair; the old refresh row is deleted (single-use).
+4. **Logout** → client calls `/logout`; that refresh row is deleted, so it can never refresh again.
+
+**The security principles this milestone demonstrates (interview-ready):**
+- **Two tokens, two jobs** — short-lived stateless access (small blast radius: a stolen access token dies in ≤15 min and can't renew itself) + long-lived stateful refresh (revocable, single-use).
+- **Never store the sensitive form** — passwords as bcrypt (slow+salted), refresh tokens as SHA-256 (fast lookup); the raw refresh token exists only on the client.
+- **Deny attackers signal** — identical vague `401` for bad-email vs bad-password, *and* constant-time login (a dummy bcrypt compare) so timing can't leak which emails exist.
+- **Fail loud on misconfig** — `getOrThrow` on the JWT secret: the app refuses to boot rather than run insecure.
+- **Rotation as a tripwire** — single-use refresh tokens mean a stolen-and-reused token gets caught (whoever presents it second is denied).
+
+**Deferred hardening (noted for later, not built):** refresh-token *reuse detection with families*; atomic `rotate` (delete-as-gate) for concurrent-refresh safety. Both are good "how would you harden this?" talking points.
