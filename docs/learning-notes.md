@@ -148,3 +148,20 @@ Careful command: `docker compose down -v` — the `-v` deletes the volume (wipes
 
 - Built so far: **minting** only — login *adds* a fresh token pair. Nothing gets deleted yet.
 - Still to come (next task): **rotation** — when the access token expires, the client sends its refresh token back; the server verifies it, **deletes that row (single-use)**, and issues a new pair. Plus **revoke** (logout = delete the row). Both reuse `issueTokens`, which is why minting had to exist first.
+
+---
+
+## Protecting routes (guard + strategy + decorator)
+
+Goal: mark a route as "valid access token required" and hand the logged-in user's identity to the handler. Four small pieces, and a request flows through them in order:
+
+1. **`JwtStrategy`** (`jwt.strategy.ts`) — the *verifier*. It pulls the token from the `Authorization: Bearer <token>` header, checks the **signature** (same `JWT_ACCESS_SECRET` we signed with) and the **expiry** (`ignoreExpiration: false` is what enforces the 15-min lifetime). Its `validate()` runs only *after* those pass, and reshapes the raw payload (`sub,email,role`) into a clean `AuthUser`. **No database call** — the signature alone proves the token is authentic.
+2. **`JwtAuthGuard`** (`jwt-auth.guard.ts`) — the *switch*. `@UseGuards(JwtAuthGuard)` on a route runs the strategy; a bad/expired/missing token → automatic **401**.
+3. **`@CurrentUser()`** (`current-user.decorator.ts`) — the *reader*. A custom **parameter decorator** that pulls the identity into a handler argument cleanly.
+4. **`GET /auth/me`** — a protected route that returns the current user, proving the chain works.
+
+**The glue is `request.user`, not a direct link.** Passport takes whatever `validate()` returns and sets `request.user` on the request. `@CurrentUser()` just *reads* `request.user`. So the strategy is the **writer**, the decorator is the **reader**, and `request.user` is the shared drop-box between them — neither imports the other (easy to swap the strategy later).
+
+- **Why a custom decorator?** So controllers don't repeat `@Req() req` → `req.user` everywhere and couple themselves to Express. You build one whenever a bit of per-request data (the user, their id, their tenant, their IP) is needed across many handlers.
+- **`getOrThrow` for secrets:** we read `JWT_ACCESS_SECRET` with `config.getOrThrow(...)` so the app **crashes loudly at boot** if the secret is missing — never silently signs/verifies with `undefined`.
+- **Stateless trade-off:** because we trust the token's contents, a role change won't take effect until the current access token expires (≤15 min). Accepted cost of not hitting the DB every request.
