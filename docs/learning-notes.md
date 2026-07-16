@@ -165,3 +165,21 @@ Goal: mark a route as "valid access token required" and hand the logged-in user'
 - **Why a custom decorator?** So controllers don't repeat `@Req() req` → `req.user` everywhere and couple themselves to Express. You build one whenever a bit of per-request data (the user, their id, their tenant, their IP) is needed across many handlers.
 - **`getOrThrow` for secrets:** we read `JWT_ACCESS_SECRET` with `config.getOrThrow(...)` so the app **crashes loudly at boot** if the secret is missing — never silently signs/verifies with `undefined`.
 - **Stateless trade-off:** because we trust the token's contents, a role change won't take effect until the current access token expires (≤15 min). Accepted cost of not hitting the DB every request.
+
+---
+
+## Refresh rotation & logout
+
+When the 15-min access token expires, the client sends its **refresh token** to `POST /auth/refresh` to get a new pair — without re-entering a password. Two methods on `TokensService`:
+
+- **`rotate(rawRefreshToken)`**: hash the incoming token → look up the row by hash (pulling in user+role) → if missing, **401**; if expired, delete it and **401**; otherwise **delete the row** and mint a fresh pair via `issueTokens`.
+- **`revoke(rawRefreshToken)`** (logout): hash it, `deleteMany` the matching row. Uses `deleteMany` so it's **idempotent** — logging out twice never errors.
+
+**Single-use is the whole point.** A refresh token is deleted the instant it's used. So:
+- Normal flow: client refreshes, gets a new token, old one is already gone — fine.
+- Theft: if an attacker uses a stolen refresh token, the *real* user's next refresh finds no row → **401**, a visible tripwire. Only one of them can win the race, and the loser is forced to log in again.
+- **Per-row = per-device:** each login/refresh is its own row, so "log out this device" deletes one row and "log out everywhere" deletes all the user's rows — surgical revocation.
+
+**Why `POST` for logout, and 204?** Logout *changes server state* (deletes a row), so it's not a `GET`. There's nothing meaningful to return, so we reply `204 No Content`.
+
+**Known limitation (future hardening):** we do plain single-use rotation. A stronger design adds **token families / reuse detection** — if a token that was *already rotated away* is presented, treat it as theft and revoke the user's whole family of tokens. Clean stretch enhancement; not built yet.

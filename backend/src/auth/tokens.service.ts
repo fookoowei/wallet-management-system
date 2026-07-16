@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { createHash, randomBytes } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -38,5 +38,38 @@ export class TokensService {
     });
 
     return { accessToken, refreshToken };
+  }
+
+  /**
+   * Exchange a valid refresh token for a fresh pair. The presented token is
+   * single-use: it is deleted the moment it's used, so a stolen-then-reused
+   * token fails (whoever presents it second gets a 401).
+   */
+  async rotate(rawRefreshToken: string) {
+    const tokenHash = this.hash(rawRefreshToken);
+    const existing = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash },
+      include: { user: { include: { role: true } } },
+    });
+
+    // No row = unknown, already-used, or revoked token.
+    if (!existing) throw new UnauthorizedException('Invalid refresh token');
+
+    // Expired: clean up the stale row and reject.
+    if (existing.expiresAt.getTime() < Date.now()) {
+      await this.prisma.refreshToken.delete({ where: { id: existing.id } });
+      throw new UnauthorizedException('Refresh token expired');
+    }
+
+    // Single-use: burn the presented token before minting a new pair.
+    await this.prisma.refreshToken.delete({ where: { id: existing.id } });
+    return this.issueTokens(existing.user);
+  }
+
+  /** Log out one device: delete its refresh-token row. Idempotent. */
+  async revoke(rawRefreshToken: string): Promise<void> {
+    await this.prisma.refreshToken.deleteMany({
+      where: { tokenHash: this.hash(rawRefreshToken) },
+    });
   }
 }
