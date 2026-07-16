@@ -186,6 +186,62 @@ When the 15-min access token expires, the client sends its **refresh token** to 
 
 ---
 
+## TypeScript: the constructor shorthand (parameter properties)
+
+- `constructor(private readonly prisma: PrismaService) {}` does **two things at once**: it *declares* a `this.prisma` field **and** *assigns* the incoming argument to it. The longhand would be a separate field declaration plus `this.prisma = prisma` in the body.
+- It's triggered by putting an access modifier (`private` / `public` / `readonly`) on a **constructor parameter**. No modifier = an ordinary throwaway argument that is *not* stored on the instance.
+- `private` = usable only inside the class; `readonly` = can't be reassigned after construction (a safety habit — you never want to swap out a dependency mid-life).
+- **Pairs with NestJS DI:** you never call `new TokensService(...)`. Nest reads the constructor's parameter *types*, finds the matching provider in its registry, and passes the shared instance in. (It can see the types at runtime thanks to `emitDecoratorMetadata` + the `@Injectable()` decorator.) So this shorthand is exactly where "declare a dependency" and "store it" meet.
+
+---
+
+## async / await & Promises (and why the handlers differ)
+
+- Anything that hits the **database, network, or disk** is asynchronous — it returns a **Promise**, a placeholder for a value that will be ready *later*.
+- **`await`** = "pause here until this Promise finishes, then continue." A function that uses `await` must be marked **`async`**. An `async` function **always** returns a Promise (so a no-value one is typed `Promise<void>`).
+- **Why `login`/`refresh` don't `await` but `logout` does:**
+  - `login`/`refresh` have a value to send back, so they `return this.service.method(...)` — *returning the promise* hands the waiting job to NestJS, which resolves it and serialises the result to JSON.
+  - `logout` has **nothing to return** (`204 No Content`). We still `await revoke(...)` so that (a) the row is actually deleted *before* we respond "logged out", and (b) a failed delete surfaces as a real HTTP error instead of a silent unhandled rejection. (`return this.tokensService.revoke(...)` would be equivalent — the `async/await` form just reads more explicitly.)
+- **The bug to avoid — fire-and-forget:** calling `this.service.method()` with *neither* `await` *nor* `return` responds *before* the work finishes and swallows any error.
+- **`@HttpCode(204)`:** a `POST` defaults to `201 Created` in Nest; logout creates nothing and returns no body, so we override to `204 No Content`.
+
+---
+
+## Prisma relations: relation field vs foreign key, and `include`
+
+- A relation in `schema.prisma` is really **two different things**:
+  - **`userId String`** — a *real column* in the database (the **foreign key**: it literally stores the related user's `id`).
+  - **`user User @relation(...)`** — a **Prisma-only relation field**. It does **not** exist as a column; it's a logical pointer meaning "the row that `userId` refers to." `SELECT * FROM "RefreshToken"` shows `userId`, never `user`.
+- **Relations aren't loaded unless you ask.** By default a query returns only the real columns, so `row.user` is `undefined`. You opt in with **`include`**:
+  - `include: { user: true }` → fetch the related user, stop there. `user.role` would be `undefined` (you'd still have `user.roleId`, the FK column).
+  - `include: { user: { include: { role: true } } }` → fetch the user **and** follow one more hop to its role. Now `user.role.name` exists. (This nested form is why `rotate` uses it — `issueTokens` needs `role.name`.)
+- **Mental model:** `true` = "load this relation, don't go deeper"; `{ include: ... }` = "load it *and* keep drilling." You only pay for the JOINs you actually ask for.
+- This is the ORM's core value: store a cheap foreign key, then *navigate* it to the full, typed object on demand — no hand-written `JOIN` SQL.
+
+---
+
+## When to build a custom decorator
+
+- `@CurrentUser()` is a **custom parameter decorator** — it extracts a piece of the request and delivers it as a handler argument, cleanly and typed.
+- **Reach for one when the same "dig something out of the request" would repeat across many handlers**, e.g.:
+  - the logged-in user → `@CurrentUser()` (ours)
+  - just their id → `@CurrentUserId()`
+  - the client IP (behind a proxy header) → `@ClientIp()`
+  - a tenant/org id from a subdomain or header → `@TenantId()`
+- Without it you'd write `@Req() req` and poke at `req.user` / `req.headers[...]` in every handler — repetitive, untyped, and it couples your controller to Express. A decorator does that extraction **once**.
+- **Don't bother** for a genuine one-off — just use `@Req()`.
+- (Decorators come in families: **class** `@Controller()`/`@Injectable()`, **method** `@Post()`/`@UseGuards()`, **property** `@IsEmail()`, **parameter** `@Body()`/`@CurrentUser()`. The kind you *write yourself* most often is the parameter one.)
+
+---
+
+## Editor squiggles vs real errors (tooling)
+
+- Red squiggles like **`Cannot find name 'jest' / 'describe' / 'expect'`** in `*.spec.ts` are usually a **false positive** — the editor's TS server resolves from the repo root, which isn't wired for Jest's types; the tests actually live under `backend/` and run fine there.
+- **Source of truth:** `npm test` (does it run?) and `npx tsc --noEmit` (does it compile?). If those are clean, the squiggle is cosmetic — ignore it.
+- Same story for the occasional `Property 'x' has no initializer` (2564) on DTO fields — the project's tsconfig doesn't enable that strict check; the `!` (definite-assignment assertion) we add just silences the editor.
+
+---
+
 ## 🔑 Milestone 2 recap — authentication, end to end
 
 The whole auth surface, and how a session lives and dies:
