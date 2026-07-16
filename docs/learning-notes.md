@@ -133,3 +133,18 @@ Careful command: `docker compose down -v` — the `-v` deletes the volume (wipes
 - Never return the `passwordHash` (or other secrets) to the client. In `register()` we strip it with destructuring:
   `const { passwordHash: _passwordHash, ...safeUser } = user;` → `safeUser` has everything *except* the hash.
 - **HTTP status via exceptions:** throwing `ConflictException` → `409`, `UnauthorizedException` → `401`, etc. NestJS maps the exception type to the right status code automatically.
+
+---
+
+## Login & the two-token model
+
+- **Two tokens, two jobs:** logging in mints an **access token** (a short-lived, signed JWT — proves who you are on every request, 15 min) and a **refresh token** (a long-lived opaque string used only to get a *new* access token).
+- **`TokensService.issueTokens(user)`** is the factory: it signs the JWT with the claims `{ sub, email, role }` and stores a **new refresh-token row** in the DB (only the SHA-256 *hash* of the token, never the raw value).
+- **`AuthService.login(dto)`**: look up the user by email, `bcrypt.compare` the password to the stored hash, and only then issue tokens.
+- **Anti-enumeration:** "no such email" and "wrong password" throw the *same* vague `401 Invalid credentials`. If they differed, an attacker could probe `/login` to discover which emails have accounts.
+- **Structural typing:** `issueTokens` declares it needs only `{ id, email, role: { name } }`. We pass the full fat Prisma `user` — extra fields are allowed as long as the required ones are present. The narrow parameter type documents the function's real needs and keeps it easy to test.
+
+## Token *minting* vs *rotation* (what's built vs coming)
+
+- Built so far: **minting** only — login *adds* a fresh token pair. Nothing gets deleted yet.
+- Still to come (next task): **rotation** — when the access token expires, the client sends its refresh token back; the server verifies it, **deletes that row (single-use)**, and issues a new pair. Plus **revoke** (logout = delete the row). Both reuse `issueTokens`, which is why minting had to exist first.
