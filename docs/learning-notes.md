@@ -270,3 +270,131 @@ The whole auth surface, and how a session lives and dies:
 - **Rotation as a tripwire** — single-use refresh tokens mean a stolen-and-reused token gets caught (whoever presents it second is denied).
 
 **Deferred hardening (noted for later, not built):** refresh-token *reuse detection with families*; atomic `rotate` (delete-as-gate) for concurrent-refresh safety. Both are good "how would you harden this?" talking points.
+
+---
+
+## Authentication vs authorization (401 vs 403)
+
+Two different questions, two different guards, and they run in a fixed order:
+
+- **Authentication — "who are you?"** — `JwtAuthGuard`. Missing / malformed / expired token → **`401 Unauthorized`**. Identity is *unknown*.
+- **Authorization — "are you allowed to do this?"** — `PermissionsGuard`. Identity is known, but the action is refused → **`403 Forbidden`**.
+
+The guard order is always `@UseGuards(JwtAuthGuard, PermissionsGuard)` — authenticate *first*, because authorization is meaningless until you know who's asking. `JwtAuthGuard` puts the caller on `request.user`; `PermissionsGuard` reads it. Flip the order and the second guard has nothing to check.
+
+The clearest way to feel the difference: hit `GET /users` three ways —
+- no token → **401** (we don't know who you are),
+- a self-registered `user`-role token → **403** (we know exactly who you are; you just may not),
+- an admin token → **200**.
+
+Same endpoint, outcome decided purely by *who is asking*. That is RBAC.
+
+---
+
+## Why the guard reads the DB, not the token
+
+This was the central design decision of the milestone. When a route needs a permission, where does the guard get the caller's permissions from?
+
+| Option | Where permissions come from | Problem |
+|---|---|---|
+| **A** | Baked into the JWT at login | A signed token **can't be un-issued**. Suspend or demote a user and their token keeps its old power until it expires (≤15 min). |
+| **B** ✅ | **DB lookup every guarded request** (`user → role → permissions`) | One extra query per request. That's it. |
+| **C** | DB + short-TTL cache | Faster, but re-introduces A's staleness for the cache window. |
+
+We chose **B**: correctness over speed, because this is the mechanism guarding money movement. A JWT is a *signed claim frozen at login* — nothing can reach back and change what it says. So we ignore what the token claims about role/permissions and ask the database, which is always current.
+
+**The proof (run live in Task 4):** promote a customer to admin, mint them a fresh token, confirm `200` on `/users`. Then an admin suspends them. The **same unexpired token**, one request later → **`403 Account suspended`**. The token still says `role: admin` and is nowhere near expiry — the guard just didn't care, because it asked Postgres. Under option A that user keeps admin access for another 15 minutes. *That* instant-revocation is what option B buys.
+
+(The token's `role` claim is still used for cheap things like `@CurrentUser().role` in separation-of-duties checks — but never as the source of truth for *what you're allowed to do*.)
+
+---
+
+## `SetMetadata` + `Reflector` — a decorator that does nothing, and a guard that reads it
+
+RBAC enforcement is split into a **tag** and a **reader** that never call each other — they communicate through NestJS's metadata store:
+
+- **`@RequirePermissions('user.manage')`** is built on `SetMetadata`. It runs **once, at startup**, when Nest scans controllers, and does exactly one thing: pins `'requiredPermissions' → ['user.manage']` onto that route. **Zero logic.** A sticky note on the door.
+- **`PermissionsGuard`** runs **before every request**. Nest hands it a `Reflector` — the tool to *read back* that metadata:
+
+  ```ts
+  const required = this.reflector.getAllAndOverride(PERMISSIONS_KEY, [
+    context.getHandler(),   // the method's metadata
+    context.getClass(),     // the controller's metadata
+  ]);
+  ```
+
+  `getAllAndOverride` reads **both** levels and lets the **handler win**. That's what makes a class-level `@RequirePermissions('user.manage')` a *default* that a single route can override — put a stricter tag on one method and it takes precedence. No metadata at all → the guard returns `true` and never touches the DB (that route simply isn't its business).
+
+This mirrors M2's `@CurrentUser`, in the opposite direction:
+
+| | `@CurrentUser` (M2) | `@RequirePermissions` (M3) |
+|---|---|---|
+| When it runs | every request | once, at startup |
+| What it does | **reads** the request (`request.user`) | **writes** metadata onto the route |
+| Who consumes it | it *is* the reader | `PermissionsGuard` reads it back |
+
+Same decorator machinery, one reads at call time, the other writes at definition time.
+
+---
+
+## Separation of duties (the two rules that make it real)
+
+`user.manage` lets an admin edit any user — which is a back door unless you close two holes. The rules live in `UsersService.updateRole`/`updateStatus`, *not* in a guard, because they depend on the *relationship* between actor and target, not just the actor's permission:
+
+1. **You cannot change your own role.** Without this, an `admin` (who holds `user.manage`) promotes *themselves* to `super_admin` and inherits every permission in the system — including `withdrawal.approve`, deliberately withheld from admins. Self-promotion is the classic privilege-escalation move; this closes it.
+2. **Only a `super_admin` may assign the `super_admin` role.** Blocking self-promotion is pointless if the admin can just crown an accomplice instead. This blocks the sideways version.
+3. (Plus a self-lockout guard: you can't suspend yourself.)
+
+**What is *deliberately allowed*:** an `admin` assigning someone the `finance` role, thereby granting `withdrawal.approve` — a permission the admin doesn't personally hold. That's **delegation**, and it's a legitimate, intended operation (a manager staffing a team), not an escalation (the admin gains nothing themselves). It is *audited* (M5), not blocked. The line: you may grant others powers you lack; you may not grant *yourself* power, nor mint another top-level admin.
+
+---
+
+## What a refactor actually is (Task 1)
+
+Task 1 moved all user/role DB access out of `AuthService` into new `UsersService`/`RolesService`. Structure changed; behaviour didn't. The tell that it was faithful:
+
+- **Assertions did not change.** Every `expect(...)` in `auth.service.spec.ts` stayed byte-for-byte identical — because they describe *behaviour*, and a refactor changes none.
+- **Mock wiring *did* change** — from a `PrismaService` mock to `UsersService`/`RolesService` mocks — because `AuthService`'s *collaborators* changed.
+
+The lesson: **mock-based unit tests are coupled to *who a class talks to*.** Rewiring a mock when collaborators change is routine. But if you ever find yourself editing an *assertion* during a "refactor," stop — behaviour drifted, and that's no longer a refactor.
+
+---
+
+## Deliberate non-goals in M3 (and why)
+
+Scope discipline is a skill; here's what we *chose not to build* and the reasoning:
+
+- **No roles/permissions CRUD.** They're seed data. An endpoint to edit them is a privilege-escalation vector (create a role with every permission, assign it to yourself) for near-zero benefit. Read-only `GET /roles` only, to populate a future dropdown.
+- **No permission caching (option C).** It trades correctness for a performance problem we don't have at this scale, and re-introduces the staleness we rejected option A to avoid. Premature.
+- **No refresh-token revocation on suspend.** A suspended user's *refresh* token still technically works — but it's harmless, because `PermissionsGuard` reads status from the DB on every request, so any action is still `403`-ed instantly. The clean fix (revoke refresh rows on suspend) forces a circular module dependency (`TokensService` → `AuthModule` → `UsersModule` → …) for a hole nothing can currently exploit. Deferred to M4.
+
+---
+
+## 🔑 Milestone 3 recap — authorization, end to end
+
+The admin surface and how a request is judged:
+
+| Method | Path | Permission | Who can call it |
+|---|---|---|---|
+| `GET` | `/users` | `user.manage` | admin, super_admin |
+| `GET` | `/users/:id` | `user.manage` | admin, super_admin |
+| `GET` | `/roles` | `user.manage` | admin, super_admin |
+| `PATCH` | `/users/:id/status` | `user.manage` | admin, super_admin (not on self) |
+| `PATCH` | `/users/:id/role` | `user.manage` | admin (super_admin role: super_admin only; not on self) |
+
+**The request lifecycle** (`Authorization: Bearer <access>` → handler):
+
+1. **`JwtAuthGuard`** intercepts. Delegates to **`JwtStrategy`**, which verifies the JWT signature + expiry (no DB) and returns a clean `AuthUser` (`{ id, email, role }`).
+2. Nest puts that `AuthUser` on **`request.user`**. Bad/missing/expired token → **`401`**, and the request never reaches the next guard.
+3. **`PermissionsGuard`** runs. Reads the route's required permissions via `Reflector.getAllAndOverride`. No permission required → allow. Otherwise it **queries the DB** by `request.user.id` for the live `user → role → permissions`.
+4. It rejects with **`403`** if: the user vanished, `status !== 'active'` (`Account suspended`), or any required code is missing. Otherwise → allow.
+5. The **handler** runs, calls a `UsersService` method, and every user-shaped result passes through **`toSafeUser`** so no `passwordHash` ever leaves.
+
+**The principles this milestone demonstrates (interview-ready):**
+- **Authorization is live, not frozen** — read authority from the DB each request, because a signed token can't be un-issued. Instant revocation is the payoff.
+- **401 ≠ 403** — unknown identity vs known-but-refused; two guards, fixed order.
+- **Least privilege + separation of duties** — permissions attach to roles, not users; and even a permission-holder can't escalate *themselves* or mint a peer.
+- **Delegation is not escalation** — granting others a power you lack is legitimate and audited; granting *yourself* power is blocked.
+- **One owner per table** — all `prisma.user` access lives in `UsersService`, all `prisma.role` in `RolesService`; nothing else touches those tables, so the "never leak the hash" rule has exactly one place to hold.
+
+**Deferred hardening (noted, not built):** refresh-token revocation on suspend (blocked by a circular dependency, harmless for now — see non-goals); permission caching; ownership-gating for customer-facing routes (that's M4, where `deposit.approve` / `withdrawal.approve` finally get consumed).
