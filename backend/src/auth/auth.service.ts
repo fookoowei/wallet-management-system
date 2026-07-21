@@ -1,6 +1,8 @@
 import { ConflictException, Injectable, UnauthorizedException } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
-import { PrismaService } from '../prisma/prisma.service';
+import { UsersService } from '../users/users.service';
+import { RolesService } from '../users/roles.service';
+import { toSafeUser } from '../users/to-safe-user';
 import { TokensService } from './tokens.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
@@ -13,37 +15,31 @@ const DUMMY_PASSWORD_HASH = bcrypt.hashSync('a-non-matching-dummy-password', 10)
 @Injectable()
 export class AuthService {
   constructor(
-    private readonly prisma: PrismaService,
+    private readonly users: UsersService,
+    private readonly roles: RolesService,
     private readonly tokens: TokensService,
   ) {}
 
   async register(dto: RegisterDto) {
-    const existing = await this.prisma.user.findUnique({ where: { email: dto.email } });
+    const existing = await this.users.findByEmail(dto.email);
     if (existing) throw new ConflictException('Email already registered');
 
-    const role = await this.prisma.role.findUniqueOrThrow({ where: { name: 'user' } });
+    const role = await this.roles.findByNameOrThrow('user');
     const passwordHash = await bcrypt.hash(dto.password, 10);
 
-    const user = await this.prisma.user.create({
-      data: {
-        email: dto.email,
-        passwordHash,
-        firstName: dto.firstName,
-        lastName: dto.lastName,
-        roleId: role.id,
-      },
+    const user = await this.users.create({
+      email: dto.email,
+      passwordHash,
+      firstName: dto.firstName,
+      lastName: dto.lastName,
+      roleId: role.id,
     });
 
-    const { passwordHash: _passwordHash, ...safeUser } = user;
-    return safeUser;
+    return toSafeUser(user);
   }
 
   async login(dto: LoginDto) {
-    // Look up by email, pulling in the role so the token can carry role.name.
-    const user = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-      include: { role: true },
-    });
+    const user = await this.users.findByEmailWithRole(dto.email);
 
     // Same vague failure for "no such email" AND "wrong password" — this denies
     // an attacker any signal about which emails have accounts (user enumeration).

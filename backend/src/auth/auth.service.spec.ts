@@ -2,7 +2,8 @@ import { Test } from '@nestjs/testing';
 import { ConflictException, UnauthorizedException } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
 import { AuthService } from './auth.service';
-import { PrismaService } from '../prisma/prisma.service';
+import { UsersService } from '../users/users.service';
+import { RolesService } from '../users/roles.service';
 import { TokensService } from './tokens.service';
 import { RegisterDto } from './dto/register.dto';
 
@@ -14,11 +15,19 @@ const dto: RegisterDto = {
 };
 
 // Build a fresh AuthService wired to mocked collaborators for each test.
-function buildService(prismaMock: any, tokensMock: any = { issueTokens: jest.fn() }) {
+// AuthService no longer knows Prisma exists — it talks to UsersService/RolesService.
+function buildService(
+  usersMock: any,
+  tokensMock: any = { issueTokens: jest.fn() },
+  rolesMock: any = {
+    findByNameOrThrow: jest.fn().mockResolvedValue({ id: 'role-user', name: 'user' }),
+  },
+) {
   return Test.createTestingModule({
     providers: [
       AuthService,
-      { provide: PrismaService, useValue: prismaMock },
+      { provide: UsersService, useValue: usersMock },
+      { provide: RolesService, useValue: rolesMock },
       { provide: TokensService, useValue: tokensMock },
     ],
   })
@@ -28,24 +37,19 @@ function buildService(prismaMock: any, tokensMock: any = { issueTokens: jest.fn(
 
 describe('AuthService.register', () => {
   it('hashes the password and returns the user without the hash', async () => {
-    const prismaMock = {
-      user: {
-        findUnique: jest.fn().mockResolvedValue(null), // email not taken
-        create: jest.fn().mockImplementation(({ data }) =>
-          Promise.resolve({
-            id: 'user-1',
-            status: 'active',
-            createdAt: new Date(),
-            updatedAt: new Date(),
-            ...data,
-          }),
-        ),
-      },
-      role: {
-        findUniqueOrThrow: jest.fn().mockResolvedValue({ id: 'role-user', name: 'user' }),
-      },
+    const usersMock = {
+      findByEmail: jest.fn().mockResolvedValue(null), // email not taken
+      create: jest.fn().mockImplementation((data) =>
+        Promise.resolve({
+          id: 'user-1',
+          status: 'active',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          ...data,
+        }),
+      ),
     };
-    const service = await buildService(prismaMock);
+    const service = await buildService(usersMock);
 
     const result = await service.register(dto);
 
@@ -54,26 +58,23 @@ describe('AuthService.register', () => {
     expect(result.email).toBe(dto.email);
 
     // What we stored must be a hash, not the plaintext password.
-    const stored = prismaMock.user.create.mock.calls[0][0].data.passwordHash;
+    const stored = usersMock.create.mock.calls[0][0].passwordHash;
     expect(stored).toBeDefined();
     expect(stored).not.toBe(dto.password);
 
     // New account gets the default 'user' role.
-    expect(prismaMock.user.create.mock.calls[0][0].data.roleId).toBe('role-user');
+    expect(usersMock.create.mock.calls[0][0].roleId).toBe('role-user');
   });
 
   it('throws ConflictException when the email is already registered', async () => {
-    const prismaMock = {
-      user: {
-        findUnique: jest.fn().mockResolvedValue({ id: 'existing', email: dto.email }),
-        create: jest.fn(),
-      },
-      role: { findUniqueOrThrow: jest.fn() },
+    const usersMock = {
+      findByEmail: jest.fn().mockResolvedValue({ id: 'existing', email: dto.email }),
+      create: jest.fn(),
     };
-    const service = await buildService(prismaMock);
+    const service = await buildService(usersMock);
 
     await expect(service.register(dto)).rejects.toBeInstanceOf(ConflictException);
-    expect(prismaMock.user.create).not.toHaveBeenCalled();
+    expect(usersMock.create).not.toHaveBeenCalled();
   });
 });
 
@@ -89,11 +90,11 @@ describe('AuthService.login', () => {
       passwordHash,
       role: { name: 'user' },
     };
-    const prismaMock = { user: { findUnique: jest.fn().mockResolvedValue(foundUser) } };
+    const usersMock = { findByEmailWithRole: jest.fn().mockResolvedValue(foundUser) };
     const tokensMock = {
       issueTokens: jest.fn().mockResolvedValue({ accessToken: 'a.jwt', refreshToken: 'r-opaque' }),
     };
-    const service = await buildService(prismaMock, tokensMock);
+    const service = await buildService(usersMock, tokensMock);
 
     const result = await service.login(credentials);
 
@@ -105,27 +106,25 @@ describe('AuthService.login', () => {
 
   it('throws UnauthorizedException when the password is wrong', async () => {
     const passwordHash = await bcrypt.hash('the-real-password', 10);
-    const prismaMock = {
-      user: {
-        findUnique: jest.fn().mockResolvedValue({
-          id: 'user-1',
-          email: credentials.email,
-          passwordHash,
-          role: { name: 'user' },
-        }),
-      },
+    const usersMock = {
+      findByEmailWithRole: jest.fn().mockResolvedValue({
+        id: 'user-1',
+        email: credentials.email,
+        passwordHash,
+        role: { name: 'user' },
+      }),
     };
     const tokensMock = { issueTokens: jest.fn() };
-    const service = await buildService(prismaMock, tokensMock);
+    const service = await buildService(usersMock, tokensMock);
 
     await expect(service.login(credentials)).rejects.toBeInstanceOf(UnauthorizedException);
     expect(tokensMock.issueTokens).not.toHaveBeenCalled(); // never issue tokens on failure
   });
 
   it('throws UnauthorizedException when the email is unknown', async () => {
-    const prismaMock = { user: { findUnique: jest.fn().mockResolvedValue(null) } };
+    const usersMock = { findByEmailWithRole: jest.fn().mockResolvedValue(null) };
     const tokensMock = { issueTokens: jest.fn() };
-    const service = await buildService(prismaMock, tokensMock);
+    const service = await buildService(usersMock, tokensMock);
 
     await expect(service.login(credentials)).rejects.toBeInstanceOf(UnauthorizedException);
     expect(tokensMock.issueTokens).not.toHaveBeenCalled();
