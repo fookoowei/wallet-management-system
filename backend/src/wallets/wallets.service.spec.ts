@@ -1,5 +1,10 @@
 import { Test } from '@nestjs/testing';
-import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { WalletsService } from './wallets.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
@@ -172,5 +177,175 @@ describe('WalletsService.requestWithdrawal', () => {
 
     await expect(service.requestWithdrawal('wallet-1', actor, 2000)).rejects.toThrow(BadRequestException);
     expect(prismaMock.transaction.create).not.toHaveBeenCalled();
+  });
+});
+
+const finance: AuthUser = { id: 'fin-1', email: 'fin@wallet.local', role: 'finance' };
+
+// A finance user holding both approve permissions, as findByIdWithPermissions returns them.
+const financeCanApprove = {
+  findByIdWithPermissions: jest.fn().mockResolvedValue({
+    id: 'fin-1',
+    status: 'active',
+    role: { permissions: [{ code: 'deposit.approve' }, { code: 'withdrawal.approve' }] },
+  }),
+};
+
+const pendingTxn = (over: Partial<any> = {}) => ({
+  id: 'txn-1',
+  walletId: 'wallet-1',
+  type: 'withdrawal',
+  amount: 2000,
+  status: 'pending',
+  requestedBy: 'user-1',
+  balanceBefore: null,
+  balanceAfter: null,
+  ...over,
+});
+
+// Build a prisma mock whose $transaction runs the callback against a tx double.
+function txPrisma(txDouble: any, extra: any = {}) {
+  return {
+    $transaction: jest.fn().mockImplementation((cb: any) => cb(txDouble)),
+    ...extra,
+  };
+}
+
+describe('WalletsService.approve', () => {
+  it('settles a withdrawal atomically and records the balance chain', async () => {
+    const txDouble = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      transaction: {
+        findUnique: jest.fn().mockResolvedValue(pendingTxn()),
+        update: jest.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'txn-1', ...data })),
+      },
+      wallet: {
+        findUnique: jest.fn().mockResolvedValue(wallet({ balance: 5000 })),
+        update: jest.fn().mockResolvedValue(undefined),
+      },
+    };
+    const service = await buildService(txPrisma(txDouble), financeCanApprove);
+
+    const result = await service.approve('txn-1', finance);
+
+    expect(txDouble.wallet.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'wallet-1' }, data: { balance: 3000 } }),
+    );
+    expect(result.status).toBe('approved');
+    expect(result.balanceBefore).toBe(5000);
+    expect(result.balanceAfter).toBe(3000);
+    expect(result.reviewedBy).toBe('fin-1');
+  });
+
+  it('settles a deposit by increasing the balance', async () => {
+    const txDouble = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      transaction: {
+        findUnique: jest.fn().mockResolvedValue(pendingTxn({ type: 'deposit', amount: 1000 })),
+        update: jest.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'txn-1', ...data })),
+      },
+      wallet: {
+        findUnique: jest.fn().mockResolvedValue(wallet({ balance: 5000 })),
+        update: jest.fn().mockResolvedValue(undefined),
+      },
+    };
+    const service = await buildService(txPrisma(txDouble), financeCanApprove);
+
+    const result = await service.approve('txn-1', finance);
+
+    expect(result.balanceAfter).toBe(6000);
+  });
+
+  it('rejects an over-balance withdrawal with 400 and moves no money', async () => {
+    const txDouble = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      transaction: {
+        findUnique: jest.fn().mockResolvedValue(pendingTxn({ amount: 9000 })),
+        update: jest.fn(),
+      },
+      wallet: { findUnique: jest.fn().mockResolvedValue(wallet({ balance: 5000 })), update: jest.fn() },
+    };
+    const service = await buildService(txPrisma(txDouble), financeCanApprove);
+
+    await expect(service.approve('txn-1', finance)).rejects.toThrow(BadRequestException);
+    expect(txDouble.wallet.update).not.toHaveBeenCalled();
+    expect(txDouble.transaction.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses to settle a non-pending request with 409 (double-approval guard)', async () => {
+    const txDouble = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      transaction: {
+        findUnique: jest.fn().mockResolvedValue(pendingTxn({ status: 'approved' })),
+        update: jest.fn(),
+      },
+      wallet: { findUnique: jest.fn(), update: jest.fn() },
+    };
+    const service = await buildService(txPrisma(txDouble), financeCanApprove);
+
+    await expect(service.approve('txn-1', finance)).rejects.toThrow(ConflictException);
+    expect(txDouble.wallet.update).not.toHaveBeenCalled();
+  });
+
+  it('throws 404 when the transaction does not exist', async () => {
+    const txDouble = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      transaction: { findUnique: jest.fn().mockResolvedValue(null), update: jest.fn() },
+      wallet: { findUnique: jest.fn(), update: jest.fn() },
+    };
+    const service = await buildService(txPrisma(txDouble), financeCanApprove);
+
+    await expect(service.approve('ghost', finance)).rejects.toThrow(NotFoundException);
+  });
+
+  it('forbids an actor lacking the type-specific approve permission (403)', async () => {
+    const txDouble = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      transaction: { findUnique: jest.fn().mockResolvedValue(pendingTxn()), update: jest.fn() },
+      wallet: { findUnique: jest.fn(), update: jest.fn() },
+    };
+    // Holds deposit.approve but NOT withdrawal.approve; the txn is a withdrawal.
+    const usersMock = {
+      findByIdWithPermissions: jest.fn().mockResolvedValue({
+        id: 'fin-1', status: 'active', role: { permissions: [{ code: 'deposit.approve' }] },
+      }),
+    };
+    const service = await buildService(txPrisma(txDouble), usersMock);
+
+    await expect(service.approve('txn-1', finance)).rejects.toThrow(ForbiddenException);
+    expect(txDouble.wallet.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('WalletsService.reject', () => {
+  it('marks a pending request rejected without touching the balance', async () => {
+    const txDouble = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      transaction: {
+        findUnique: jest.fn().mockResolvedValue(pendingTxn()),
+        update: jest.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'txn-1', ...data })),
+      },
+      wallet: { findUnique: jest.fn(), update: jest.fn() },
+    };
+    const service = await buildService(txPrisma(txDouble), financeCanApprove);
+
+    const result = await service.reject('txn-1', finance, 'suspicious');
+
+    expect(result.status).toBe('rejected');
+    expect(txDouble.wallet.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses to reject a non-pending request with 409', async () => {
+    const txDouble = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      transaction: {
+        findUnique: jest.fn().mockResolvedValue(pendingTxn({ status: 'rejected' })),
+        update: jest.fn(),
+      },
+      wallet: { findUnique: jest.fn(), update: jest.fn() },
+    };
+    const service = await buildService(txPrisma(txDouble), financeCanApprove);
+
+    await expect(service.reject('txn-1', finance)).rejects.toThrow(ConflictException);
   });
 });

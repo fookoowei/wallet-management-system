@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -56,6 +57,85 @@ export class WalletsService {
     return this.prisma.transaction.create({
       data: { walletId: id, type: 'withdrawal', amount, status: 'pending', requestedBy: actor.id, note },
     });
+  }
+
+  listPending() {
+    return this.prisma.transaction.findMany({
+      where: { status: 'pending' },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  async approve(txnId: string, actor: AuthUser) {
+    return this.prisma.$transaction(async (tx) => {
+      // Lock the transaction row first (fixed order: txn, then wallet).
+      await tx.$queryRaw`SELECT id FROM "Transaction" WHERE id = ${txnId} FOR UPDATE`;
+      const txn = await tx.transaction.findUnique({ where: { id: txnId } });
+      if (!txn) throw new NotFoundException('Transaction not found');
+      if (txn.status !== 'pending') throw new ConflictException('Transaction already reviewed');
+
+      // Type-specific permission — depends on the loaded row's type (like M3's SoD checks).
+      await this.assertApprovePermission(actor, txn.type);
+
+      // Lock the wallet row, then read its true current balance.
+      await tx.$queryRaw`SELECT id FROM "Wallet" WHERE id = ${txn.walletId} FOR UPDATE`;
+      const wallet = await tx.wallet.findUnique({ where: { id: txn.walletId } });
+      if (!wallet) throw new NotFoundException('Wallet not found');
+
+      const before = wallet.balance;
+      let after: number;
+      if (txn.type === 'withdrawal') {
+        if (before < txn.amount) throw new BadRequestException('Insufficient funds');
+        after = before - txn.amount;
+      } else {
+        after = before + txn.amount; // deposit
+      }
+
+      await tx.wallet.update({ where: { id: wallet.id }, data: { balance: after } });
+      return tx.transaction.update({
+        where: { id: txn.id },
+        data: {
+          status: 'approved',
+          reviewedBy: actor.id,
+          reviewedAt: new Date(),
+          balanceBefore: before,
+          balanceAfter: after,
+        },
+      });
+    });
+  }
+
+  async reject(txnId: string, actor: AuthUser, note?: string) {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Transaction" WHERE id = ${txnId} FOR UPDATE`;
+      const txn = await tx.transaction.findUnique({ where: { id: txnId } });
+      if (!txn) throw new NotFoundException('Transaction not found');
+      if (txn.status !== 'pending') throw new ConflictException('Transaction already reviewed');
+
+      await this.assertApprovePermission(actor, txn.type);
+
+      return tx.transaction.update({
+        where: { id: txn.id },
+        data: {
+          status: 'rejected',
+          reviewedBy: actor.id,
+          reviewedAt: new Date(),
+          note: note ?? txn.note,
+        },
+      });
+    });
+  }
+
+  /**
+   * Approving a deposit needs deposit.approve; a withdrawal needs withdrawal.approve.
+   * Which one is required depends on the row's type, so the check is here, not in a
+   * static route guard. Permissions are read from the DB (never the token) — M3's rule.
+   */
+  private async assertApprovePermission(actor: AuthUser, type: string) {
+    const code = type === 'withdrawal' ? 'withdrawal.approve' : 'deposit.approve';
+    const user = await this.users.findByIdWithPermissions(actor.id);
+    const held = new Set(user?.role.permissions.map((permission) => permission.code) ?? []);
+    if (!held.has(code)) throw new ForbiddenException('Access denied');
   }
 
   /**
