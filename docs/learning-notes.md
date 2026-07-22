@@ -398,3 +398,197 @@ The admin surface and how a request is judged:
 - **One owner per table** — all `prisma.user` access lives in `UsersService`, all `prisma.role` in `RolesService`; nothing else touches those tables, so the "never leak the hash" rule has exactly one place to hold.
 
 **Deferred hardening (noted, not built):** refresh-token revocation on suspend (blocked by a circular dependency, harmless for now — see non-goals); permission caching; ownership-gating for customer-facing routes (that's M4, where `deposit.approve` / `withdrawal.approve` finally get consumed).
+
+---
+
+## Money is an integer, never a float
+
+`0.1 + 0.2 === 0.30000000000000004` in JavaScript. Floats are binary fractions and cannot represent most decimal amounts exactly, so every arithmetic step accumulates a tiny error. In a ledger those errors compound and the books stop balancing — a fatal flaw in finance.
+
+The fix is universal in payments: **store money as an integer in the currency's smallest unit** ("minor units"). `RM 100.00` is stored as `10000` (sen). `Int` in Prisma, `INTEGER` in Postgres, whole numbers everywhere. You divide by 100 only at the last moment, for display.
+
+Two supporting rules we enforce:
+- **`amount` is always positive.** Direction comes from `type` (`deposit` / `withdrawal` / `adjustment`), never from a minus sign. Signed amounts invite the bug where a "deposit of -500" quietly becomes a withdrawal that skipped every withdrawal check.
+- **Floats are rejected at the boundary.** `@IsInt()` on the DTO means `{"amount": 10.5}` gets a `400` before it reaches any logic. Money never enters the system in a form that could round.
+
+## The immutable ledger (append-only)
+
+`Wallet.balance` is a **derived cache**, not the truth. The truth is the `Transaction` table, and rows there are **appended, never edited or deleted**.
+
+- Made a mistake? You don't edit the wrong row — you append a **new `adjustment` row** that corrects it. The error stays visible, and so does the correction. That's what "auditable" means.
+- Every **settled** row records `balanceBefore` and `balanceAfter`. Read them in order and they form an unbroken chain:
+
+```
+0 → 10000 → 0 → 5000        and  wallet.balance = 5000  ✅
+```
+
+Each row's `after` is the next row's `before`. That lets you **recompute the balance from the ledger alone** and prove the `Wallet` table isn't lying — exactly what a reconciliation job or an auditor does. A mismatch means something wrote to `balance` outside the settlement path.
+
+- `pending` and `rejected` rows carry `null` for both. They're a record of *what was asked and what was decided*, without participating in the arithmetic.
+
+## Two phases: requesting ≠ settling
+
+`POST /wallets/:id/deposits` creates a `pending` row and **moves no money**. Nothing changes a balance until a `finance` user approves it. Proof from the live run: a pending deposit of `10000` sat in the ledger while the wallet still read `balance: 0`.
+
+This is also why there are **two different balance checks** for a withdrawal, and confusing them is a classic bug:
+
+| | At request time | At settlement |
+|---|---|---|
+| Purpose | **UX** — don't let a customer file a doomed request | **Correctness** — protect the invariant |
+| Authoritative? | **No** | **Yes** |
+| Why | the balance can change before approval | it runs under a row lock, on the true current balance |
+
+Never let the friendly check stand in for the real one.
+
+## 🔒 The heart of it: settlement, races, and pessimistic locking
+
+**The race.** Two finance users open the pending queue. Both see the same withdrawal of `10000` against a balance of `10000`. Both click approve within the same millisecond. Naively:
+
+```
+A: read balance = 10000     B: read balance = 10000
+A: 10000 >= 10000 ✅        B: 10000 >= 10000 ✅
+A: write balance = 0        B: write balance = 0
+```
+
+Both checks passed against the *same stale read*. The customer withdrew `20000` from a wallet holding `10000`. This is the **double-spend**, and no amount of careful `if` statements in JavaScript fixes it — the gap between "read" and "write" is where the other request slips in.
+
+**Two distinct invariants, two distinct guards.** It's tempting to think the balance check covers everything. It doesn't:
+
+| Invariant | Check | Failure |
+|---|---|---|
+| A request settles **at most once** | `txn.status !== 'pending'` | **409** Conflict |
+| A balance is **never negative** | `before < txn.amount` | **400** Bad Request |
+
+Approve a `10000` withdrawal twice against a `30000` balance and the funds check passes *both* times — yet one request debited `20000`. Different failure, different guard. Neither substitutes for the other.
+
+**The fix: pessimistic row locking.** Everything happens inside one `prisma.$transaction(async (tx) => …)`, and the first thing we do is take a lock:
+
+```sql
+SELECT id FROM "Transaction" WHERE id = $1 FOR UPDATE
+```
+
+We throw the result away — reading the `id` is pointless. The **side effect is the whole point**: Postgres marks that row locked, and any other transaction issuing `FOR UPDATE` on the same row **blocks** until we commit or roll back. So request B doesn't get a stale read; it gets *no read at all* until A finishes. When B finally proceeds, A has already flipped `status` to `approved`, so B's own status check fires → `409`.
+
+The lock turns "check, then subtract" from two separate steps into one **indivisible** operation. That's the definition of atomicity, and it can only be enforced by the database — the only component that sees all the concurrent requests at once.
+
+**Always re-read inside the lock.** The approver's browser showed a balance fetched seconds ago; that number is already stale. Settlement ignores it, ignores the request-time check, and reads the true current balance *after* taking the lock. Anything read before the lock may have changed.
+
+**Fixed lock order: transaction row, then wallet row.** Always that sequence, everywhere. If one code path locked wallet→txn while another locked txn→wallet, two requests could each hold what the other is waiting for — a **deadlock**, where both stall until the database kills one. A globally consistent lock order makes that impossible. It costs nothing today and is what saves us in M4c, when a transfer must lock *two* wallets (order them by id, always).
+
+**Don't do unrelated I/O while holding a lock.** Found and fixed in the M4a review: the permission check originally ran *inside* the transaction, and it reads through the root Prisma client — borrowing a **second connection from the pool while holding the first**. With enough concurrent approvals (the pool defaults to roughly `cpus × 2 + 1`), every transaction holds one connection and waits for another that never comes: a pool-starvation deadlock. It also held the row lock across an extra network round-trip. The fix: run it *before* the transaction opens, using `type` — which is written once and never changes. Everything **mutable** (`status`, `balance`) is still re-read under the lock. General rule: **hold locks for as short a time as possible, and do nothing under them that isn't strictly necessary.**
+
+**The proof (real Postgres, not a mock).** One pending withdrawal for the full balance, four approvals fired simultaneously:
+
+```
+1:200  2:409  3:409  4:409      balance: 5000 → 0
+```
+
+Exactly one winner, three refused, debited exactly once. This is the single most valuable demo in the project — most systems *claim* concurrency safety and can't show it.
+
+**Honest caveat:** that proof is a **manual curl demo**, not an automated test. The unit tests exercise the *logic* against a mocked `tx` where `$queryRaw` is a no-op — so `npm test` would **not** catch someone deleting the `FOR UPDATE` lines. A real integration harness against a dedicated test database is deferred (see below). Knowing what your tests *don't* cover is part of the job.
+
+## Ownership-gating vs permission-gating (two different questions)
+
+M4a introduces a second authorization mechanism alongside M3's:
+
+| | Permission-gating (M3) | Ownership-gating (M4a) |
+|---|---|---|
+| Question | "does my **role** allow this kind of action?" | "is this **record** mine?" |
+| Inputs | the caller alone | the caller **+ the loaded row** |
+| Lives in | a **guard** (`PermissionsGuard`) | the **service** (`wallet.userId === actor.id`) |
+| Reusable | yes, on any route | no — depends on each route's data shape |
+
+Two shapes of ownership scoping, both used:
+- **Filter** — `listWallets` uses `where: { userId: actor.id }`. Another user's wallets simply aren't in the result set; no `403` is even possible.
+- **Fetch-then-check** — `getWallet` loads by id and compares. Missing → `404`, someone else's → `403`.
+
+`listTransactions` calls the ownership check **before** reading any transactions, and a test asserts `transaction.findMany` was never called for a non-owner. That's the test that catches the classic leak of doing the work first and checking permission afterwards.
+
+Note that even `super_admin` gets `403` on `/wallets/:id` — customer routes are owner-scoped, full stop. Staff use the finance routes, which are permission-gated and audited. Separating those doors is itself an audit control.
+
+**Why the type-specific approve check can't be a guard.** The deciding test is: *can you name the required permission before loading any row?*
+
+```
+adjust   → always 'wallet.adjust'                        ← constant, known at startup
+approve  → 'deposit.approve' OR 'withdrawal.approve'     ← depends on txn.type
+```
+
+`@RequirePermissions('wallet.adjust')` is `SetMetadata` — it runs **once when the class is defined** and staples a constant onto the route forever. It cannot say "whichever code matches a row we haven't fetched." So `approve` *couldn't* use it. This is the same principle as M3's separation-of-duties rules, which compare the actor to the loaded target user.
+
+Three further reasons data-dependent checks don't belong in guards:
+1. **Double-fetch** — the guard loads the row, then the service loads it again. Stashing it on `request.wallet` works but makes the service silently depend on a guard having run, with no compile error if it's removed.
+2. **Guards run before pipes.** Nest's order is `middleware → guards → interceptors → pipes → handler`, so a guard sees raw unvalidated params — `ParseUUIDPipe` hasn't run yet.
+3. **Guards run before the transaction exists.** Anything a guard checked could be stale by settlement time — precisely the race locking exists to close.
+
+> **Guard when the permission is a constant. Service when it depends on the data.**
+
+**Guards stack.** `/wallets/:id/adjustments` carries a method-level `@UseGuards(PermissionsGuard)` **on top of** the controller's class-level `JwtAuthGuard`; Nest runs both. Other routes on that controller run only the class guard — and `PermissionsGuard` is a no-op on routes without `@RequirePermissions` (it returns `true` without touching the DB), which is what makes stacking safe.
+
+## POST vs PATCH (and why `approve` returns 200)
+
+The deciding test is **idempotency** — does calling it twice differ from calling it once?
+
+| | `PATCH /users/:id/status` | `POST /wallets/:id/adjustments` | `POST /transactions/:id/approve` |
+|---|---|---|---|
+| What it does | edits a field on an existing thing | **creates** a new ledger row | performs an **action** |
+| Called twice | identical result | money moves **twice** | first `200`, second **`409`** |
+| Idempotent | yes | no | no |
+
+- **PATCH** = partial update of an existing resource; send only the changed fields.
+- **POST** = create a subordinate resource, or trigger a non-idempotent action. The plural noun (`/adjustments`, `/deposits`) is a collection you're appending to. A UI must never blindly auto-retry a POST.
+
+`approve` is a **state-machine transition with side effects**, not a field edit — `PATCH {status:"approved"}` would invite the client to think it's just setting a column, when it actually runs settlement under locks. Its non-idempotency is deliberate: the second call *must* `409`.
+
+Caught in review: Nest returns **201 Created** for POST by default, but approving creates nothing from the client's view — it settles an existing request. Both settle routes now use `@HttpCode(200)`. The request and adjustment routes genuinely do create rows, so `201` is correct there.
+
+## Direct adjustments — a deliberate control weakness
+
+`POST /wallets/:id/adjustments` lets finance credit or debit **any** wallet with no request phase (chargeback reversal, goodwill bonus, correcting an operational error). It's permission-gated, not owner-gated — which is why a customer gets `403` adjusting *their own* wallet. Owning a wallet doesn't let you print money into it; ownership and privilege are orthogonal questions.
+
+Here `requestedBy === reviewedBy`: one person both raises and settles it. That is genuinely the weakest control in the system, and it exists because real operations need it. It's mitigated three ways — a narrow permission (`wallet.adjust`), a **mandatory** `note` (`@MinLength(1)`, so no silent money movement), and M5's audit log. A regulated shop would add maker-checker above a threshold. Naming a known gap beats pretending it isn't there.
+
+The invariant still holds: a debit cannot drive the balance below zero, and it takes the same wallet lock. Privileged ≠ unconstrained.
+
+## Deliberate non-goals in M4a (and why)
+
+- **No transfers, no FX, no KYC yet.** The M4 family is ordered by dependency: **4a core ledger → 4b KYC → 4c transfers → 4d currency conversion**. A transfer is two settlements against one another, and FX is a transfer with a rate — neither can be built before settlement is solid. KYC comes second because it's the *same* request → review → approve shape built here, so it reuses a pattern you already understand, and the money routes then gain a verified-only gate (like a real e-wallet).
+- **No ledger mutation.** No edit or delete endpoints for transactions, ever. Corrections are new rows.
+- **No FK on `requestedBy` / `reviewedBy`.** Plain userId strings. Making them relations needs two *named* relations plus back-references on `User`, all for a query M4a never runs. YAGNI.
+- **`403` vs `404` leaks existence.** Returning them distinctly lets someone probe which wallet ids exist. Accepted for now — ids are uuidv4, so guessing is infeasible — but a uniform `404` is the hardening move, noted not built.
+- **No pagination on the finance queue.** `GET /transactions/pending` and `GET /wallets/:id/transactions` return everything, unlike `GET /users` which caps `take` at 100. Fine at demo scale, a real problem after a year of traffic. Recorded as deferred rather than bolted on during a review pass.
+
+---
+
+## 🔑 Milestone 4a recap — the ledger, end to end
+
+| Method | Path | Gate | Who can call it |
+|---|---|---|---|
+| `POST` | `/wallets` | authenticated | any user (owner forced from the token) |
+| `GET` | `/wallets` | authenticated + **filter** | any user — sees only their own |
+| `GET` | `/wallets/:id` | authenticated + **ownership** | the owner only (`403` even for super_admin) |
+| `GET` | `/wallets/:id/transactions` | authenticated + **ownership** | the owner only |
+| `POST` | `/wallets/:id/deposits` | authenticated + **ownership** | the owner — creates a `pending` row |
+| `POST` | `/wallets/:id/withdrawals` | authenticated + **ownership** | the owner — creates a `pending` row |
+| `GET` | `/transactions/pending` | `transaction.view_all` | finance, admin, support |
+| `POST` | `/transactions/:id/approve` | `view_all` **+** type-specific in service | finance, super_admin |
+| `POST` | `/transactions/:id/reject` | `view_all` **+** type-specific in service | finance, super_admin |
+| `POST` | `/wallets/:id/adjustments` | `wallet.adjust` | finance, super_admin |
+
+Four routes, four genuinely different authorization questions — and every check that depends on row data lives in the service.
+
+**The money-movement lifecycle:**
+
+1. **Request.** Owner posts a deposit/withdrawal. Ownership verified, amount validated as a positive integer, friendly balance pre-check on withdrawals. A `pending` row is written. **No balance changes.**
+2. **Review.** A finance user lists `/transactions/pending`. An `admin` can *see* this queue but **cannot approve** — viewing and approving are separate privileges, so an admin-level compromise can't drain wallets.
+3. **Settle.** `approve` checks the type-specific permission, then opens one DB transaction: lock the txn row → re-read it → `409` if not `pending` → lock the wallet row → read the true balance → `400` if a withdrawal would go negative → update the balance → stamp the row `approved` with `balanceBefore`/`balanceAfter`, `reviewedBy`, `reviewedAt`. All or nothing.
+4. **Or reject.** Same locks and the same `409` guard, but no money moves. The row stays forever as a record of the decision.
+
+**Interview-ready principles:**
+- **Integers for money, direction in the type** — floats can't represent decimals exactly, and signed amounts hide bugs.
+- **The ledger is the truth; the balance is a cache** — append-only, and the `before`/`after` chain lets you prove the cache is honest.
+- **Concurrency safety is a database property, not a code property** — `FOR UPDATE` inside a transaction makes check-then-write indivisible; a fixed lock order pre-empts deadlock; hold locks briefly and do no unrelated I/O under them.
+- **Two invariants, two guards** — settle-at-most-once (`409`) and never-negative (`400`); neither implies the other.
+- **Authorization has two shapes** — constant permission → guard; data-dependent → service.
+- **Name your weak controls** — self-approved adjustments are the soft spot, mitigated by a narrow permission, a mandatory reason, and an audit trail to come.
+
+**Deferred (noted, not built):** integration-test harness against a real test DB (so the locking is covered by `npm test`, not just a curl demo); pagination on the finance queue and wallet history; uniform-`404` hardening; maker-checker on large adjustments; refresh-token revocation on suspend (still carried from M3); transfers (M4c), FX (M4d), KYC gating (M4b).
