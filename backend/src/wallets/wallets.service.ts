@@ -127,6 +127,43 @@ export class WalletsService {
   }
 
   /**
+   * Finance-only direct correction/bonus. No pending stage: locks the wallet, applies a
+   * credit or debit, and writes an already-settled adjustment row — all atomically.
+   * Route-gated by wallet.adjust (permission), so no per-type check here.
+   */
+  async adjust(
+    walletId: string,
+    dto: { direction: 'credit' | 'debit'; amount: number; note: string },
+    actor: AuthUser,
+  ) {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Wallet" WHERE id = ${walletId} FOR UPDATE`;
+      const wallet = await tx.wallet.findUnique({ where: { id: walletId } });
+      if (!wallet) throw new NotFoundException('Wallet not found');
+
+      const before = wallet.balance;
+      const after = dto.direction === 'credit' ? before + dto.amount : before - dto.amount;
+      if (after < 0) throw new BadRequestException('Adjustment would make the balance negative');
+
+      await tx.wallet.update({ where: { id: walletId }, data: { balance: after } });
+      return tx.transaction.create({
+        data: {
+          walletId,
+          type: 'adjustment',
+          amount: dto.amount,
+          balanceBefore: before,
+          balanceAfter: after,
+          status: 'approved',
+          requestedBy: actor.id,
+          reviewedBy: actor.id,
+          reviewedAt: new Date(),
+          note: dto.note,
+        },
+      });
+    });
+  }
+
+  /**
    * Approving a deposit needs deposit.approve; a withdrawal needs withdrawal.approve.
    * Which one is required depends on the row's type, so the check is here, not in a
    * static route guard. Permissions are read from the DB (never the token) — M3's rule.

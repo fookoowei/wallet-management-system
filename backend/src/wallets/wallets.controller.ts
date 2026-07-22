@@ -1,10 +1,13 @@
 import { Body, Controller, Get, Param, ParseUUIDPipe, Post, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { PermissionsGuard } from '../auth/permissions.guard';
+import { RequirePermissions } from '../auth/require-permissions.decorator';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { AuthUser } from '../auth/jwt.strategy';
 import { WalletsService } from './wallets.service';
 import { CreateWalletDto } from './dto/create-wallet.dto';
 import { MoneyAmountDto } from './dto/money-amount.dto';
+import { AdjustmentDto } from './dto/adjustment.dto';
 
 // JwtAuthGuard only: there is no *permission* a customer holds to read their own
 // wallet. Ownership is enforced in the service, because it depends on the row.
@@ -49,5 +52,18 @@ export class WalletsController {
     @Body() dto: MoneyAmountDto,
   ) {
     return this.wallets.requestWithdrawal(id, actor, dto.amount, dto.note);
+  }
+
+  // Finance-only: adjust ANY wallet (no ownership check — permission-gated, not owner-gated).
+  // A method-level @UseGuards runs *in addition to* the class-level JwtAuthGuard.
+  @Post(':id/adjustments')
+  @UseGuards(PermissionsGuard)
+  @RequirePermissions('wallet.adjust')
+  adjust(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: AdjustmentDto,
+    @CurrentUser() actor: AuthUser,
+  ) {
+    return this.wallets.adjust(id, dto, actor);
   }
 }

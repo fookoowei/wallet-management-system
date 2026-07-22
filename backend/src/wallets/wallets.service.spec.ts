@@ -349,3 +349,75 @@ describe('WalletsService.reject', () => {
     await expect(service.reject('txn-1', finance)).rejects.toThrow(ConflictException);
   });
 });
+
+describe('WalletsService.adjust', () => {
+  it('credits a wallet and writes a settled adjustment row', async () => {
+    const txDouble = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      wallet: {
+        findUnique: jest.fn().mockResolvedValue(wallet({ balance: 5000 })),
+        update: jest.fn().mockResolvedValue(undefined),
+      },
+      transaction: {
+        create: jest.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'adj-1', ...data })),
+      },
+    };
+    const service = await buildService(txPrisma(txDouble));
+
+    const result = await service.adjust('wallet-1', { direction: 'credit', amount: 1000, note: 'bonus' }, finance);
+
+    expect(txDouble.wallet.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'wallet-1' }, data: { balance: 6000 } }),
+    );
+    expect(result.type).toBe('adjustment');
+    expect(result.status).toBe('approved');
+    expect(result.balanceBefore).toBe(5000);
+    expect(result.balanceAfter).toBe(6000);
+  });
+
+  it('debits a wallet', async () => {
+    const txDouble = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      wallet: {
+        findUnique: jest.fn().mockResolvedValue(wallet({ balance: 5000 })),
+        update: jest.fn().mockResolvedValue(undefined),
+      },
+      transaction: {
+        create: jest.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'adj-1', ...data })),
+      },
+    };
+    const service = await buildService(txPrisma(txDouble));
+
+    const result = await service.adjust('wallet-1', { direction: 'debit', amount: 2000, note: 'correction' }, finance);
+
+    expect(result.balanceAfter).toBe(3000);
+  });
+
+  it('refuses a debit that would drive the balance below zero (400)', async () => {
+    const txDouble = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      wallet: { findUnique: jest.fn().mockResolvedValue(wallet({ balance: 500 })), update: jest.fn() },
+      transaction: { create: jest.fn() },
+    };
+    const service = await buildService(txPrisma(txDouble));
+
+    await expect(
+      service.adjust('wallet-1', { direction: 'debit', amount: 2000, note: 'oops' }, finance),
+    ).rejects.toThrow(BadRequestException);
+    expect(txDouble.wallet.update).not.toHaveBeenCalled();
+    expect(txDouble.transaction.create).not.toHaveBeenCalled();
+  });
+
+  it('throws 404 when the wallet does not exist', async () => {
+    const txDouble = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      wallet: { findUnique: jest.fn().mockResolvedValue(null), update: jest.fn() },
+      transaction: { create: jest.fn() },
+    };
+    const service = await buildService(txPrisma(txDouble));
+
+    await expect(
+      service.adjust('ghost', { direction: 'credit', amount: 1000, note: 'x' }, finance),
+    ).rejects.toThrow(NotFoundException);
+  });
+});
