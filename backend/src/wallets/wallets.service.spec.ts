@@ -1,5 +1,5 @@
 import { Test } from '@nestjs/testing';
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { WalletsService } from './wallets.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
@@ -111,5 +111,66 @@ describe('WalletsService.listTransactions (ownership)', () => {
 
     await expect(service.listTransactions('wallet-1', other)).rejects.toThrow(ForbiddenException);
     expect(prismaMock.transaction.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('WalletsService.requestDeposit', () => {
+  it('creates a pending deposit and changes no balance', async () => {
+    const prismaMock = {
+      wallet: { findUnique: jest.fn().mockResolvedValue(wallet({ balance: 500 })) },
+      transaction: { create: jest.fn().mockImplementation(({ data }) => Promise.resolve(data)) },
+    };
+    const service = await buildService(prismaMock);
+
+    const result = await service.requestDeposit('wallet-1', actor, 1000, 'salary');
+
+    expect(prismaMock.transaction.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          walletId: 'wallet-1', type: 'deposit', amount: 1000, status: 'pending', requestedBy: 'user-1',
+        }),
+      }),
+    );
+    expect(result.balanceBefore).toBeUndefined(); // pending rows carry no settled balance
+  });
+
+  it('refuses to deposit into a wallet the actor does not own', async () => {
+    const prismaMock = {
+      wallet: { findUnique: jest.fn().mockResolvedValue(wallet()) },
+      transaction: { create: jest.fn() },
+    };
+    const service = await buildService(prismaMock);
+
+    await expect(service.requestDeposit('wallet-1', other, 1000)).rejects.toThrow(ForbiddenException);
+    expect(prismaMock.transaction.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('WalletsService.requestWithdrawal', () => {
+  it('creates a pending withdrawal when funds appear sufficient', async () => {
+    const prismaMock = {
+      wallet: { findUnique: jest.fn().mockResolvedValue(wallet({ balance: 5000 })) },
+      transaction: { create: jest.fn().mockImplementation(({ data }) => Promise.resolve(data)) },
+    };
+    const service = await buildService(prismaMock);
+
+    await service.requestWithdrawal('wallet-1', actor, 2000);
+
+    expect(prismaMock.transaction.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ type: 'withdrawal', amount: 2000, status: 'pending' }),
+      }),
+    );
+  });
+
+  it('rejects an obviously-insufficient withdrawal request early (friendly 400)', async () => {
+    const prismaMock = {
+      wallet: { findUnique: jest.fn().mockResolvedValue(wallet({ balance: 100 })) },
+      transaction: { create: jest.fn() },
+    };
+    const service = await buildService(prismaMock);
+
+    await expect(service.requestWithdrawal('wallet-1', actor, 2000)).rejects.toThrow(BadRequestException);
+    expect(prismaMock.transaction.create).not.toHaveBeenCalled();
   });
 });

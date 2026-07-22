@@ -4,6 +4,7 @@ import { CurrentUser } from '../auth/current-user.decorator';
 import type { AuthUser } from '../auth/jwt.strategy';
 import { WalletsService } from './wallets.service';
 import { CreateWalletDto } from './dto/create-wallet.dto';
+import { MoneyAmountDto } from './dto/money-amount.dto';
 
 // JwtAuthGuard only: there is no *permission* a customer holds to read their own
 // wallet. Ownership is enforced in the service, because it depends on the row.
@@ -30,5 +31,23 @@ export class WalletsController {
   @Get(':id/transactions')
   listTransactions(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() actor: AuthUser) {
     return this.wallets.listTransactions(id, actor);
+  }
+
+  @Post(':id/deposits')
+  requestDeposit(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() actor: AuthUser,
+    @Body() dto: MoneyAmountDto,
+  ) {
+    return this.wallets.requestDeposit(id, actor, dto.amount, dto.note);
+  }
+
+  @Post(':id/withdrawals')
+  requestWithdrawal(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() actor: AuthUser,
+    @Body() dto: MoneyAmountDto,
+  ) {
+    return this.wallets.requestWithdrawal(id, actor, dto.amount, dto.note);
   }
 }
