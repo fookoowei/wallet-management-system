@@ -20,6 +20,7 @@ model User {
   role         Role     @relation(fields: [roleId], references: [id])
   roleId       String
   refreshTokens RefreshToken[]
+  wallets      Wallet[]
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -50,4 +51,39 @@ model RefreshToken {
   createdAt DateTime @default(now())
 
   @@index([userId])
+}
+
+model Wallet {
+  id           String        @id @default(uuid())
+  user         User          @relation(fields: [userId], references: [id])
+  userId       String
+  name         String
+  currency     String        // ISO code, e.g. "USD"; fixed per wallet (FX is M4d)
+  balance      Int           @default(0) // minor units; invariant: never < 0
+  transactions Transaction[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([userId])
+}
+
+// Append-only ledger. A row is created `pending` and later settled exactly once.
+// `amount` is always positive — `type` carries the direction.
+model Transaction {
+  id            String    @id @default(uuid())
+  wallet        Wallet    @relation(fields: [walletId], references: [id])
+  walletId      String
+  type          String    // deposit | withdrawal | adjustment
+  amount        Int       // minor units, always positive; type carries direction
+  balanceBefore Int?      // null while pending; set at settlement
+  balanceAfter  Int?      // null while pending; set at settlement
+  status        String    @default("pending") // pending | approved | rejected
+  requestedBy   String    // userId (plain string; no FK — YAGNI, see plan note)
+  reviewedBy    String?   // userId of the finance approver; null while pending
+  reviewedAt    DateTime?
+  note          String?
+  createdAt     DateTime  @default(now())
+
+  @@index([walletId])
+  @@index([status])
 }
