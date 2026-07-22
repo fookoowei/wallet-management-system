@@ -67,15 +67,19 @@ export class WalletsService {
   }
 
   async approve(txnId: string, actor: AuthUser) {
+    // Permission check runs BEFORE the transaction opens: it needs only `type`, which is
+    // immutable, and it does unrelated I/O (a user+permissions read). Doing it under the
+    // row lock would hold that lock across an extra round-trip and borrow a second pool
+    // connection while holding the first — a pool-starvation deadlock under load.
+    await this.assertApprovePermission(actor, await this.getSettleableType(txnId));
+
     return this.prisma.$transaction(async (tx) => {
       // Lock the transaction row first (fixed order: txn, then wallet).
       await tx.$queryRaw`SELECT id FROM "Transaction" WHERE id = ${txnId} FOR UPDATE`;
       const txn = await tx.transaction.findUnique({ where: { id: txnId } });
       if (!txn) throw new NotFoundException('Transaction not found');
+      // Re-checked under the lock: unlike `type`, status CAN change between the two reads.
       if (txn.status !== 'pending') throw new ConflictException('Transaction already reviewed');
-
-      // Type-specific permission — depends on the loaded row's type (like M3's SoD checks).
-      await this.assertApprovePermission(actor, txn.type);
 
       // Lock the wallet row, then read its true current balance.
       await tx.$queryRaw`SELECT id FROM "Wallet" WHERE id = ${txn.walletId} FOR UPDATE`;
@@ -106,13 +110,13 @@ export class WalletsService {
   }
 
   async reject(txnId: string, actor: AuthUser, note?: string) {
+    await this.assertApprovePermission(actor, await this.getSettleableType(txnId));
+
     return this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "Transaction" WHERE id = ${txnId} FOR UPDATE`;
       const txn = await tx.transaction.findUnique({ where: { id: txnId } });
       if (!txn) throw new NotFoundException('Transaction not found');
       if (txn.status !== 'pending') throw new ConflictException('Transaction already reviewed');
-
-      await this.assertApprovePermission(actor, txn.type);
 
       return tx.transaction.update({
         where: { id: txn.id },
@@ -161,6 +165,20 @@ export class WalletsService {
         },
       });
     });
+  }
+
+  /**
+   * The transaction's `type`, read outside any lock. Safe to read early because `type` is
+   * written once at request time and never changes; everything mutable is re-read under the
+   * lock. Returns 404 here so a bad id fails before we bother taking locks.
+   */
+  private async getSettleableType(txnId: string) {
+    const txn = await this.prisma.transaction.findUnique({
+      where: { id: txnId },
+      select: { type: true },
+    });
+    if (!txn) throw new NotFoundException('Transaction not found');
+    return txn.type;
   }
 
   /**

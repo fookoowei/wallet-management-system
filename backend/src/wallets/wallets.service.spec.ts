@@ -204,8 +204,11 @@ const pendingTxn = (over: Partial<any> = {}) => ({
 });
 
 // Build a prisma mock whose $transaction runs the callback against a tx double.
+// The double is also spread at the root, because some reads (e.g. the pre-lock `type`
+// lookup) deliberately run on the root client rather than inside the transaction.
 function txPrisma(txDouble: any, extra: any = {}) {
   return {
+    ...txDouble,
     $transaction: jest.fn().mockImplementation((cb: any) => cb(txDouble)),
     ...extra,
   };

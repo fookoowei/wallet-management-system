@@ -1,4 +1,13 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PermissionsGuard } from '../auth/permissions.guard';
 import { RequirePermissions } from '../auth/require-permissions.decorator';
@@ -21,12 +30,15 @@ export class TransactionsController {
     return this.wallets.listPending();
   }
 
+  // 200, not Nest's default 201: settling an existing request creates no new resource.
   @Post(':id/approve')
+  @HttpCode(200)
   approve(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() actor: AuthUser) {
     return this.wallets.approve(id, actor);
   }
 
   @Post(':id/reject')
+  @HttpCode(200)
   reject(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() actor: AuthUser,
