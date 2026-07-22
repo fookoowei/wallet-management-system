@@ -487,6 +487,71 @@ Exactly one winner, three refused, debited exactly once. This is the single most
 
 **Honest caveat:** that proof is a **manual curl demo**, not an automated test. The unit tests exercise the *logic* against a mocked `tx` where `$queryRaw` is a no-op — so `npm test` would **not** catch someone deleting the `FOR UPDATE` lines. A real integration harness against a dedicated test database is deferred (see below). Knowing what your tests *don't* cover is part of the job.
 
+## `tx` vs `this.prisma` — the most dangerous typo in the file
+
+A database transaction lives on **one specific connection**. `BEGIN`, your statements, `COMMIT` — all on the same wire. Postgres has no idea that two connections are "related".
+
+```
+this.prisma  →  the connection POOL  →  hands you *any* free connection
+tx           →  THE one connection holding the open BEGIN
+```
+
+So inside `$transaction(async (tx) => …)`:
+
+```typescript
+await tx.wallet.update(...)           // ✅ inside the transaction
+await this.prisma.wallet.update(...)  // ❌ different connection — OUTSIDE it
+```
+
+That second line would break the system three ways:
+- **It ignores the locks.** `FOR UPDATE` protects `tx`'s connection. A write on another connection isn't covered by it, so the double-spend race comes straight back.
+- **It won't roll back.** If a later line throws, Prisma rolls back `tx`'s work — but the `this.prisma` write already committed on its own. Result: a debited wallet with no ledger row. A corrupted book, the exact failure this whole design exists to prevent.
+- **It can deadlock against itself.** `this.prisma` waits for a row that `tx` has locked, while `tx` waits for `this.prisma` to finish. One request, two connections, stuck forever.
+
+**Rule: once you're inside the callback, `tx` is the only client you may touch.** Every line in `approve`/`reject`/`adjust` uses `tx.` — that's load-bearing, not stylistic.
+
+## Which reads can happen *before* the lock
+
+The same connection fact explains the Task 6 refactor. `assertApprovePermission` calls `UsersService`, which uses *its own* `this.prisma` — a **second connection taken while holding the first**. With a pool of ~`cpus × 2 + 1` (say 9), nine concurrent approvals take all nine connections, then each asks for a tenth that doesn't exist, and each waits on a connection held by a peer that is also waiting. Everything stalls until the 5s transaction timeout kills it. It only appears under concurrency — never in dev.
+
+Moving it out is safe because of **mutability**, and that's the general test:
+
+| Column | Mutable? | Read where |
+|---|---|---|
+| `type` | written once at request time, never changes | **before** the lock ✅ |
+| `status` | changes at settlement — the whole point | **under** the lock, always |
+| `balance` | changes at settlement | **under** the lock, always |
+
+`type` has no writer, so there's nothing to race against: reading it early gives the same answer as reading it late. `status` and `balance` are re-read under the lock, every time.
+
+> **Do the expensive, unrelated, immutable-data work outside the lock. Hold the lock only for what can change under you.**
+
+## Why `async (tx) => { … }` needs its own `async`
+
+`$transaction` takes a **function**, not a value, because Prisma needs to wrap your code:
+
+```
+Prisma:  BEGIN
+Prisma:  ─── calls your callback, handing it tx ───
+you:        lock, read, check, update, update
+Prisma:  COMMIT        (or ROLLBACK if you threw)
+```
+
+The callback's *shape* is the transaction's boundary — you never write `BEGIN`/`ROLLBACK` yourself. It's also why throwing anywhere inside is a clean abort: Prisma catches it, rolls back, and rethrows so Nest converts it to the right 400/404/409.
+
+`async` is **not inherited** from an enclosing function. It belongs to whichever function directly contains the `await`s — and here there are two functions with two sets of awaits:
+
+```typescript
+async approve(...)            // ← awaits getSettleableType
+  return this.prisma.$transaction(
+    async (tx) => {           // ← a separate function, awaits tx.$queryRaw
+      await tx.$queryRaw`...`
+    }
+  )
+```
+
+Nesting isn't redundancy. And note `approve` **returns** the `$transaction` promise: it resolves only once the transaction has actually **committed**, and the callback's return value becomes the method's result. That's why the HTTP response can never show an `approved` row that didn't commit.
+
 ## Ownership-gating vs permission-gating (two different questions)
 
 M4a introduces a second authorization mechanism alongside M3's:
@@ -503,6 +568,15 @@ Two shapes of ownership scoping, both used:
 - **Fetch-then-check** — `getWallet` loads by id and compares. Missing → `404`, someone else's → `403`.
 
 `listTransactions` calls the ownership check **before** reading any transactions, and a test asserts `transaction.findMany` was never called for a non-owner. That's the test that catches the classic leak of doing the work first and checking permission afterwards.
+
+**Calling a check for its exceptions, not its value.** `requestDeposit` does `await this.getOwnedWallet(id, actor);` and discards the result — the tell that it's being called for its *throws*. (`requestWithdrawal` writes `const wallet = …` because it actually needs `wallet.balance`.) Delete that line and two things break:
+
+1. **Someone else's wallet would work.** `walletId` comes from the **URL** — attacker-controlled input — not from the token. Postgres is happy; the FK is valid. You'd have written a pending transaction against a stranger's wallet, sitting in the finance queue waiting to be approved. Nothing downstream catches it: the approver checks *permissions*, not "was this request legitimately raised by the owner". The forgery would settle.
+2. **A missing wallet returns 500 instead of 404.** `transaction.create` would hit a foreign-key violation (`P2003`), and with no handler Nest reports a 500. A bad *request* misreported as a broken *server*.
+
+> **Validate a caller-supplied id against the caller before writing anything derived from it.**
+
+The `await` is also load-bearing: drop it and the check returns an un-awaited promise, execution falls through to `create`, the row is written, and the rejection surfaces later as an unhandled rejection. A missing `await` in front of an authorization check is a silent security hole — which is why `@typescript-eslint/no-floating-promises` is worth enabling (M7).
 
 Note that even `super_admin` gets `403` on `/wallets/:id` — customer routes are owner-scoped, full stop. Staff use the finance routes, which are permission-gated and audited. Separating those doors is itself an audit control.
 
