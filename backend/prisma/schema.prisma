@@ -82,8 +82,13 @@ model Transaction {
   reviewedBy    String?   // userId of the finance approver; null while pending
   reviewedAt    DateTime?
   note          String?
+  // Transfers only: both halves of one transfer share this id, so the pair is provably one event.
+  transferId    String?
+  // Transfers only: the other wallet in the pair, so a row is self-describing without a second query.
+  counterpartyWalletId String?
   createdAt     DateTime  @default(now())
 
   @@index([walletId])
   @@index([status])
+  @@index([transferId])
 }
