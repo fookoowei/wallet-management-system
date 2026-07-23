@@ -8,6 +8,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import type { AuthUser } from '../auth/jwt.strategy';
+import { randomUUID } from 'crypto';
 
 @Injectable()
 export class WalletsService {
@@ -164,6 +165,95 @@ export class WalletsService {
           note: dto.note,
         },
       });
+    });
+  }
+
+  /**
+   * Instant wallet-to-wallet transfer, same currency. Writes a linked pair of settled
+   * ledger rows (transfer_out on the sender, transfer_in on the receiver) sharing a
+   * transferId, and moves both balances inside one DB transaction.
+   */
+  async transfer(
+    fromWalletId: string,
+    actor: AuthUser,
+    dto: { toWalletId: string; amount: number; note?: string },
+  ) {
+    // Checked before the transaction: locking one row twice is meaningless, and the
+    // arithmetic below would double-count a single wallet.
+    if (dto.toWalletId === fromWalletId) {
+      throw new BadRequestException('Cannot transfer to the same wallet');
+    }
+
+    // Ownership of the SOURCE only — the destination belongs to someone else, which is
+    // the entire point of a transfer. Done before the transaction opens (M4a's lesson:
+    // no unrelated I/O while holding a lock); ownership cannot change mid-request.
+    await this.getOwnedWallet(fromWalletId, actor);
+
+    const transferId = randomUUID();
+    // Deterministic lock order. NOT sender-then-receiver: if it were, Alice->Bob and
+    // Bob->Alice running concurrently would each hold the row the other needs, and
+    // Postgres would kill one for deadlock. Sorted, both lock the same wallet first.
+    const [firstLock, secondLock] = [fromWalletId, dto.toWalletId].sort();
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Wallet" WHERE id = ${firstLock} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM "Wallet" WHERE id = ${secondLock} FOR UPDATE`;
+
+      // Re-read under the locks: these balances are the only ones we may trust.
+      const from = await tx.wallet.findUnique({ where: { id: fromWalletId } });
+      if (!from) throw new NotFoundException('Wallet not found');
+      const to = await tx.wallet.findUnique({ where: { id: dto.toWalletId } });
+      if (!to) throw new NotFoundException('Destination wallet not found');
+
+      if (from.currency !== to.currency) {
+        throw new BadRequestException('Wallets must share a currency'); // conversion is M4c
+      }
+      if (from.balance < dto.amount) throw new BadRequestException('Insufficient funds');
+
+      const fromAfter = from.balance - dto.amount;
+      const toAfter = to.balance + dto.amount;
+      const settledAt = new Date();
+
+      await tx.wallet.update({ where: { id: from.id }, data: { balance: fromAfter } });
+      await tx.wallet.update({ where: { id: to.id }, data: { balance: toAfter } });
+
+      // Both halves are settled at creation and credited to the sender: they initiated
+      // the movement, and the receiver reviewed nothing.
+      const shared = {
+        transferId,
+        amount: dto.amount,
+        status: 'approved',
+        requestedBy: actor.id,
+        reviewedBy: actor.id,
+        reviewedAt: settledAt,
+        note: dto.note,
+      };
+
+      const outRow = await tx.transaction.create({
+        data: {
+          ...shared,
+          walletId: from.id,
+          type: 'transfer_out',
+          counterpartyWalletId: to.id,
+          balanceBefore: from.balance,
+          balanceAfter: fromAfter,
+        },
+      });
+
+      await tx.transaction.create({
+        data: {
+          ...shared,
+          walletId: to.id,
+          type: 'transfer_in',
+          counterpartyWalletId: from.id,
+          balanceBefore: to.balance,
+          balanceAfter: toAfter,
+        },
+      });
+
+      // Only the sender's row is returned: the receiver's row carries their balance,
+      // which the sender has no right to see.
+      return outRow;
     });
   }
 

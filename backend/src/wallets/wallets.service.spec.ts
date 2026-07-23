@@ -424,3 +424,164 @@ describe('WalletsService.adjust', () => {
     ).rejects.toThrow(NotFoundException);
   });
 });
+
+// Two wallets: 'wallet-1' owned by user-1 (the actor), 'wallet-2' owned by user-2.
+// findUnique is id-aware so one mock serves both the pre-lock ownership read and the
+// two reads inside the transaction.
+function transferPrisma(overrides: Record<string, any> = {}) {
+  const rows: Record<string, any> = {
+    'wallet-1': wallet({ id: 'wallet-1', userId: 'user-1', balance: 5000 }),
+    'wallet-2': wallet({ id: 'wallet-2', userId: 'user-2', balance: 100 }),
+    ...overrides,
+  };
+  const txDouble = {
+    $queryRaw: jest.fn().mockResolvedValue([]),
+    wallet: {
+      findUnique: jest.fn(({ where }: any) => Promise.resolve(rows[where.id] ?? null)),
+      update: jest.fn().mockResolvedValue(undefined),
+    },
+    transaction: {
+      create: jest.fn().mockImplementation(({ data }: any) =>
+        Promise.resolve({ id: `txn-${data.type}`, ...data }),
+      ),
+    },
+  };
+  return { txDouble, prisma: txPrisma(txDouble) };
+}
+
+describe('WalletsService.transfer', () => {
+  it('writes a linked pair with a shared transferId and unbroken chains', async () => {
+    const { txDouble, prisma } = transferPrisma();
+    const service = await buildService(prisma);
+
+    const result = await service.transfer('wallet-1', actor, {
+      toWalletId: 'wallet-2',
+      amount: 2000,
+    });
+
+    const [outRow, inRow] = txDouble.transaction.create.mock.calls.map((call: any[]) => call[0].data);
+
+    expect(outRow.type).toBe('transfer_out');
+    expect(outRow.walletId).toBe('wallet-1');
+    expect(outRow.balanceBefore).toBe(5000);
+    expect(outRow.balanceAfter).toBe(3000);
+    expect(outRow.counterpartyWalletId).toBe('wallet-2');
+
+    expect(inRow.type).toBe('transfer_in');
+    expect(inRow.walletId).toBe('wallet-2');
+    expect(inRow.balanceBefore).toBe(100);
+    expect(inRow.balanceAfter).toBe(2100);
+    expect(inRow.counterpartyWalletId).toBe('wallet-1');
+
+    // One event: both halves carry the same id.
+    expect(outRow.transferId).toBeTruthy();
+    expect(inRow.transferId).toBe(outRow.transferId);
+
+    // Both rows are settled at creation, credited to the sender.
+    expect(outRow.status).toBe('approved');
+    expect(inRow.status).toBe('approved');
+    expect(inRow.requestedBy).toBe('user-1');
+
+    // Only the sender's row is returned — the receiver's balance must not leak.
+    expect(result.type).toBe('transfer_out');
+  });
+
+  it('debits the sender and credits the receiver by the same amount', async () => {
+    const { txDouble, prisma } = transferPrisma();
+    const service = await buildService(prisma);
+
+    await service.transfer('wallet-1', actor, { toWalletId: 'wallet-2', amount: 2000 });
+
+    expect(txDouble.wallet.update).toHaveBeenCalledWith({
+      where: { id: 'wallet-1' },
+      data: { balance: 3000 },
+    });
+    expect(txDouble.wallet.update).toHaveBeenCalledWith({
+      where: { id: 'wallet-2' },
+      data: { balance: 2100 },
+    });
+  });
+
+  it('locks both wallets in sorted-id order regardless of direction', async () => {
+    // This is the deadlock-prevention property, asserted directly: whichever way the
+    // money flows, the locks are taken in the same order.
+    const forward = transferPrisma();
+    const forwardService = await buildService(forward.prisma);
+    await forwardService.transfer('wallet-1', actor, { toWalletId: 'wallet-2', amount: 100 });
+
+    const backward = transferPrisma();
+    const backwardService = await buildService(backward.prisma);
+    await backwardService.transfer('wallet-2', other, { toWalletId: 'wallet-1', amount: 50 });
+
+    // $queryRaw is a tagged template: call[0] is the strings array, call[1] the interpolated id.
+    const lockedForward = forward.txDouble.$queryRaw.mock.calls.map((call: any[]) => call[1]);
+    const lockedBackward = backward.txDouble.$queryRaw.mock.calls.map((call: any[]) => call[1]);
+
+    expect(lockedForward).toEqual(['wallet-1', 'wallet-2']);
+    expect(lockedBackward).toEqual(['wallet-1', 'wallet-2']);
+  });
+
+  it('rejects a transfer to the same wallet without opening a transaction', async () => {
+    const { prisma } = transferPrisma();
+    const service = await buildService(prisma);
+
+    await expect(
+      service.transfer('wallet-1', actor, { toWalletId: 'wallet-1', amount: 100 }),
+    ).rejects.toThrow(BadRequestException);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('rejects a cross-currency transfer and moves no money', async () => {
+    const { txDouble, prisma } = transferPrisma({
+      'wallet-2': wallet({ id: 'wallet-2', userId: 'user-2', balance: 100, currency: 'EUR' }),
+    });
+    const service = await buildService(prisma);
+
+    await expect(
+      service.transfer('wallet-1', actor, { toWalletId: 'wallet-2', amount: 100 }),
+    ).rejects.toThrow(BadRequestException);
+    expect(txDouble.wallet.update).not.toHaveBeenCalled();
+    expect(txDouble.transaction.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects a transfer larger than the sender’s balance', async () => {
+    const { txDouble, prisma } = transferPrisma();
+    const service = await buildService(prisma);
+
+    await expect(
+      service.transfer('wallet-1', actor, { toWalletId: 'wallet-2', amount: 9000 }),
+    ).rejects.toThrow(BadRequestException);
+    expect(txDouble.wallet.update).not.toHaveBeenCalled();
+    expect(txDouble.transaction.create).not.toHaveBeenCalled();
+  });
+
+  it('refuses to send from a wallet the actor does not own', async () => {
+    const { txDouble, prisma } = transferPrisma();
+    const service = await buildService(prisma);
+
+    // 'other' is user-2, who does not own wallet-1.
+    await expect(
+      service.transfer('wallet-1', other, { toWalletId: 'wallet-2', amount: 100 }),
+    ).rejects.toThrow(ForbiddenException);
+    expect(txDouble.transaction.create).not.toHaveBeenCalled();
+  });
+
+  it('throws 404 when the source wallet does not exist', async () => {
+    const { prisma } = transferPrisma();
+    const service = await buildService(prisma);
+
+    await expect(
+      service.transfer('ghost', actor, { toWalletId: 'wallet-2', amount: 100 }),
+    ).rejects.toThrow(NotFoundException);
+  });
+
+  it('throws 404 when the destination wallet does not exist', async () => {
+    const { txDouble, prisma } = transferPrisma();
+    const service = await buildService(prisma);
+
+    await expect(
+      service.transfer('wallet-1', actor, { toWalletId: 'ghost', amount: 100 }),
+    ).rejects.toThrow(NotFoundException);
+    expect(txDouble.wallet.update).not.toHaveBeenCalled();
+  });
+});
