@@ -666,3 +666,117 @@ Four routes, four genuinely different authorization questions — and every chec
 - **Name your weak controls** — self-approved adjustments are the soft spot, mitigated by a narrow permission, a mandatory reason, and an audit trail to come.
 
 **Deferred (noted, not built):** integration-test harness against a real test DB (so the locking is covered by `npm test`, not just a curl demo); pagination on the finance queue and wallet history; uniform-`404` hardening; maker-checker on large adjustments; refresh-token revocation on suspend (still carried from M3); transfers (M4c), FX (M4d), KYC gating (M4b).
+
+---
+
+# Milestone 4b — wallet-to-wallet transfers
+
+## Deterministic lock ordering — why sorting the two ids kills deadlock
+
+M4a locked one wallet at a time. A transfer touches **two**, and that is where a new failure mode appears: **deadlock**.
+
+Picture two transfers running at the same instant:
+
+```
+Alice → Bob      needs to lock wallet A, then wallet B
+Bob   → Alice    needs to lock wallet B, then wallet A
+```
+
+If each locks **its own sender first**, the interleaving that ruins you is:
+
+```
+Alice→Bob  locks A ✓ … now waits for B
+Bob→Alice  locks B ✓ … now waits for A
+```
+
+Each holds exactly what the other is waiting for, and neither will ever let go. That is a **deadlock** — a cycle in the "who-waits-for-whom" graph. Postgres detects the cycle and kills one transaction as a victim (`40P01 deadlock_detected`), which surfaces to the client as a `500`.
+
+The fix is almost too simple: **don't lock sender-first — lock in a fixed, direction-independent order.** Sort the two ids and always lock the smaller one first:
+
+```typescript
+const [firstLock, secondLock] = [fromWalletId, dto.toWalletId].sort();
+await tx.$queryRaw`SELECT id FROM "Wallet" WHERE id = ${firstLock} FOR UPDATE`;
+await tx.$queryRaw`SELECT id FROM "Wallet" WHERE id = ${secondLock} FOR UPDATE`;
+```
+
+Now **both** transfers — Alice→Bob and Bob→Alice — try to lock the *same* wallet first (whichever id sorts lower). One wins and proceeds; the other simply **queues** on that first lock and waits its turn. There is no cycle to form, so deadlock becomes *impossible*, not merely rare. The live proof (40 crossing transfers, zero `500`s) demonstrates it.
+
+**Two separate `FOR UPDATE` statements, not `WHERE id IN (a, b) ORDER BY id`.** It's tempting to lock both rows in one query. Don't: Postgres locks rows in the order the **query plan** yields them, which is *not* guaranteed to follow your `ORDER BY`. Two sequential statements are provably ordered — the first fully completes before the second begins.
+
+**Self-transfer is rejected (`400`) before the transaction even opens.** Locking one row twice is meaningless, and the arithmetic (`balance - amount`, then `balance + amount` on the *same* wallet) would be nonsense.
+
+## Why this race yields `400`, not `409`
+
+In M4a, the danger was **double-settlement** — approving the same pending request twice — caught by re-reading `status` under the lock and throwing `409` if it wasn't `pending`. You might expect the concurrent-drain race here to behave the same way. It doesn't, and the reason is worth internalising: **the two invariants are independent.**
+
+- **Settle-at-most-once (`409`)** protects a *shared pending row*. A transfer has **no pending row** — it settles instantly and each transfer is its own independent event. There is nothing to "settle twice", so this guard simply does not apply.
+- **Never-negative (`400`)** protects a *balance*. When two transfers of 5000 hit a wallet holding 5000, the loser isn't re-settling anything — it's trying to *spend money that isn't there*. The `from.balance < amount` check under the lock catches it and throws `400`.
+
+Same lock, same wallet, but a different invariant is doing the work — so a different status code is correct. The live proof shows exactly one `201` and one `400`, final balance `0`, never `-5000`.
+
+## Double-entry in the ledger — one movement, two rows
+
+A transfer writes **two** `Transaction` rows, not one:
+
+```
+sender   wallet A:  transfer_out  amt=2500  before=100000  after=97500   transferId=T1  counterparty=B
+receiver wallet B:  transfer_in   amt=2500  before=100000  after=102500  transferId=T1  counterparty=A
+```
+
+Why two rows instead of a single row with a `from` and a `to`? Because M4a's core property must survive: **every `Transaction` belongs to exactly one wallet, and every wallet's `balanceBefore → balanceAfter` chain must stay unbroken and recomputable from its own rows alone.** A single shared row physically cannot record a before/after for *two* wallets — one side's chain would have a gap. So each wallet gets its own row, its own honest chain entry.
+
+The two halves are tied together by a shared **`transferId`** (a `randomUUID()` minted before the transaction) — that's what proves they are one event rather than two coincidental rows. `counterpartyWalletId` points the opposite way on each side, so a row is self-describing without a second query. No `Transfer` table is needed: the shared id gives the linkage at zero schema cost, exactly as `requestedBy`/`reviewedBy` are plain strings.
+
+Both rows are written `status: 'approved'` and stamped with the **sender's** id as both `requestedBy` and `reviewedBy` — the sender initiated the movement, and the receiver reviewed nothing.
+
+## Asymmetric authorization — and why no new permission
+
+The two wallets are checked **differently**, on purpose:
+
+| Wallet | Check | Reasoning |
+|---|---|---|
+| **Source** | ownership (`getOwnedWallet`) | you may only send *your own* money |
+| **Destination** | existence only — no ownership check | it belongs to someone else; that is what a transfer *is* |
+
+No `transfer.*` permission exists in the seed, and none is needed. Moving your own money is a **capability of ownership**, not a privilege a role grants — so this is pure ownership-gating (the M4a mechanism), with no guard involved. Contrast `adjust`, which touches *anyone's* wallet and therefore *does* need a permission (`wallet.adjust`). The question "do I need a permission?" comes down to "am I acting on something that's mine, or on the system at large?"
+
+## Response privacy — decide what *leaves*, not just what's stored
+
+The endpoint returns **only the sender's `transfer_out` row**. The receiver's `transfer_in` row carries *their* `balanceBefore`/`balanceAfter` — i.e. their account balance — and returning it would leak that to anyone able to send them money. You may hand someone funds; you may not learn what they hold.
+
+This is the same instinct as `toSafeUser` back in M2: security isn't only about what you *store*, it's about what you let *leave* in a response. Here the whole pair is written to the database (both parties need their history), but only one half is returned to the caller.
+
+## Deliberate non-goals in M4b (and why)
+
+- **Cross-currency transfers → M4c.** Rejected with `400` here rather than silently converting at 1:1 — a wrong conversion is worse than a refusal.
+- **Reversals / disputes.** The ledger is append-only; a reversal is a *new opposing pair*, which needs its own design (who authorises it, against which original). Not a `DELETE`.
+- **Recipient lookup by email.** Needs a primary-wallet rule (a user may own several) plus account-enumeration hardening — a separate problem. Using a wallet id keeps this milestone on the actual hard part: two-wallet locking.
+- **Transfer limits, velocity checks, fraud rules.** Real risk controls, but a distinct subsystem.
+- **Threshold-based approval** (instant below a limit, review above). The most realistic model for a regulated operator and a good later enhancement — but it means building both the instant and the approval paths at once.
+- **Blocking transfers to a suspended recipient.** Deliberately *allowed*. Refusing would leak the recipient's account status to the sender, and a frozen account still *holds* inbound funds rather than bouncing them — which matches how real platforms behave.
+
+## 🔑 Milestone 4b recap — transfers, end to end
+
+One new endpoint on the existing wallets controller:
+
+| Method | Path | Gate | Who can call it |
+|---|---|---|---|
+| `POST` | `/wallets/:id/transfers` | authenticated + **ownership of source** | the source owner — destination need only exist |
+
+**The transfer lifecycle:**
+
+1. **Validate cheaply, outside the lock.** Reject self-transfer (`400`); confirm the caller **owns the source** (`403`/`404`). Both are immutable facts, safe to check before opening a transaction — and doing so means no lock is wasted on a doomed request.
+2. **Lock both wallets in sorted-id order.** Two separate `SELECT … FOR UPDATE` statements, smaller id first, so concurrent opposite-direction transfers can never deadlock.
+3. **Re-read under the locks.** Only now are the two balances trustworthy. Verify same currency (`400`) and sufficient funds (`400`).
+4. **Move both balances**, then **write the linked pair** — `transfer_out` on the sender, `transfer_in` on the receiver — sharing one `transferId`, each with its own unbroken chain. All inside one `$transaction`: both rows land or neither does.
+5. **Return the sender's row only.** The receiver's balance never leaves the system.
+
+**Interview-ready principles (new in 4b):**
+- **Deadlock is a lock-*ordering* problem, not a locking problem** — take multiple locks in a fixed, data-independent order (sort the ids) and cycles cannot form.
+- **Detection vs prevention** — Postgres will *detect* a deadlock and kill a victim (`40P01`), but a correct lock order *prevents* it ever happening.
+- **Independent invariants, independent codes** — the same physical race yields `400` (never-negative) here and `409` (settle-once) in M4a, because different invariants are guarding.
+- **Double-entry keeps every chain honest** — one row per wallet, linked by a shared id; no single row can record two wallets' histories.
+- **Authorization asymmetry mirrors the real world** — own your source, only reach the destination; ownership is a capability, so no new permission.
+- **Response privacy is a first-class concern** — control what leaves, not only what's stored.
+
+**Deferred (noted, not built):** FX conversion (M4c); reversals/disputes; recipient lookup by email; transfer limits / velocity / fraud rules; threshold-based approval; the integration-test harness against a real test DB (so lock ordering is covered by `npm test`, not just the curl proofs); pagination on wallet history; KYC gating (optional, unscheduled).
