@@ -748,7 +748,7 @@ This is the same instinct as `toSafeUser` back in M2: security isn't only about 
 
 ## Deliberate non-goals in M4b (and why)
 
-- **Cross-currency transfers → M4c.** Rejected with `400` here rather than silently converting at 1:1 — a wrong conversion is worse than a refusal.
+- **Cross-currency transfers → M4c.** Rejected with `400` here rather than silently converting at 1:1 — a wrong conversion is worse than a refusal. *(Built in M4c — see below.)*
 - **Reversals / disputes.** The ledger is append-only; a reversal is a *new opposing pair*, which needs its own design (who authorises it, against which original). Not a `DELETE`.
 - **Recipient lookup by email.** Needs a primary-wallet rule (a user may own several) plus account-enumeration hardening — a separate problem. Using a wallet id keeps this milestone on the actual hard part: two-wallet locking.
 - **Transfer limits, velocity checks, fraud rules.** Real risk controls, but a distinct subsystem.
@@ -780,3 +780,120 @@ One new endpoint on the existing wallets controller:
 - **Response privacy is a first-class concern** — control what leaves, not only what's stored.
 
 **Deferred (noted, not built):** FX conversion (M4c); reversals/disputes; recipient lookup by email; transfer limits / velocity / fraud rules; threshold-based approval; the integration-test harness against a real test DB (so lock ordering is covered by `npm test`, not just the curl proofs); pagination on wallet history; KYC gating (optional, unscheduled).
+
+---
+
+# Milestone 4c — cross-currency transfers (FX conversion)
+
+## A transfer with a rate — the debit and the credit are *not* equal
+
+A cross-currency transfer is just the M4b transfer **plus one number**. Everything from 4b survives untouched: sorted two-wallet locking, the linked ledger pair, response privacy. The only new idea is that the amount leaving and the amount arriving are **in different currencies, so they are deliberately different numbers**:
+
+```
+Alice USD wallet  ──  debit 50000 USD  ──►  Bob EUR wallet  ──  credit 43890 EUR
+                          rate 0.87781 recorded on BOTH rows
+```
+
+That breaks an assumption 4b quietly relied on: that both halves of a transfer share one `amount`. So `amount` moved **out** of the shared object — each row now records **its own currency's** figure (the debit on the sender, the converted credit on the receiver). What still ties the pair together is the shared `transferId`, plus the `exchangeRate` stamped identically on both.
+
+Recording the rate matters for audit: a year later you can re-derive the credit from the debit and prove the conversion was right. Without it, `50000 out / 43890 in` looks like money vanished.
+
+## Fetch the rate *before* the lock — and the chicken-and-egg it creates
+
+The rule from M4a — **never do unrelated I/O while holding a lock** — gets much sharper here. Locks are held until the transaction commits, so every millisecond inside the transaction is a millisecond two wallets are frozen. An external HTTP call can hang for *seconds*. Put it inside the lock and a slow FX provider freezes two wallets, and with enough of those, the DB connection pool starves and the whole app stalls.
+
+So the rate is fetched **before** `$transaction` opens. But that creates a chicken-and-egg:
+
+> To know whether we even *need* a rate, we need both wallets' currencies. Doesn't reading them require the lock?
+
+**No — and the reason is the same one from M4a.** `currency` is **immutable**: it is set when a wallet is created and never changes. Immutable data can be read early and trusted, exactly like M4a's `type`. Only **mutable** data — the balances — must be re-read under the lock.
+
+That splits the method cleanly in two:
+
+```
+BEFORE the lock (slow, external, immutable reads)
+  ├─ reject self-transfer
+  ├─ check ownership of the source        ← immutable
+  ├─ read the destination's currency      ← immutable
+  └─ fetch the rate + compute the credit  ← external HTTP; may take seconds
+
+INSIDE the lock (fast, local, mutable only)
+  ├─ lock both wallets in sorted-id order
+  ├─ re-read the two balances             ← mutable, only trustworthy here
+  ├─ check funds, move both balances
+  └─ write the linked ledger pair
+```
+
+By the time anything is locked, the conversion is **already a fixed integer**. The transaction does nothing but local arithmetic and writes — microseconds.
+
+## Banker's rounding — why half-up is the wrong default for money
+
+Converting produces fractions, but money is stored as whole minor units, so the credit must be rounded. The obvious choice — round half **up** — has a real flaw: it is **biased**. Every exact `.5` tie goes upward, so across millions of conversions the rounding never cancels out and value systematically leaks in one direction.
+
+**Banker's rounding (round half to even)** breaks the tie by going to the nearest *even* number instead — sometimes up, sometimes down:
+
+| value | half-up | half-to-even |
+|---|---|---|
+| 2.5 | 3 | **2** |
+| 3.5 | 4 | **4** |
+| 4.5 | 5 | **4** |
+
+Over volume, ties split roughly evenly and the bias cancels. This is the IEEE-754 and accounting default, which is why it's the right one here.
+
+Two details make it work:
+- **`Prisma.Decimal` (Decimal.js), never `Math.round`.** `Math.round` is half-up *and* operates on floats, which can't even represent `0.1` exactly. `Decimal` does exact base-10 math and provides `ROUND_HALF_EVEN` for free.
+- We proved it twice: unit tests pin the ties `0.025 × 100 → 2` and `0.045 × 100 → 4`, and the **live** run happened to land on a genuine tie — `50000 × 0.87781 = 43890.5`, credited as **43890** (even), where half-up would have paid out 43891.
+
+## Fail-closed — a refusal beats a wrong number
+
+If the rate provider is down or doesn't know the pair, we **throw `503` and move no money**. No cached rate, no stale fallback, no 1:1 guess.
+
+The principle: **money must never move at an unknown or stale rate.** A failed transfer is a mild annoyance the user retries; a transfer settled at a wrong rate is a financial loss and a reconciliation nightmare. When correctness can't be guaranteed, refuse.
+
+The placement matters as much as the decision. Because the rate is fetched before the transaction opens, the failure lands **before any lock is taken and before any write** — there is nothing to roll back. The live proof: a `USD → XYZ` transfer returned `503`, the sender's balance was unchanged, and the destination had **zero** ledger rows.
+
+## The swappable provider seam
+
+`RatesService` is the **only** place in the app that makes the FX HTTP call — enforced by a boundary check that greps for `fetch(` outside `src/rates/`. Wallet logic asks for a rate; it has no idea who answers.
+
+That means every likely future change is a **one-file swap**, with no risk to the money code:
+- move to a **keyed/commercial provider** (better uptime, historical rates)
+- add **caching with a TTL** to cut API calls and ride out blips
+- add a **fallback chain** across providers
+
+This is the same instinct as `WalletsModule` being the only place that touches `prisma.wallet` / `prisma.transaction`: put a wall around the thing most likely to change, so churn can't leak into the thing that must never break.
+
+## Deliberate non-goals in M4c (and why)
+
+- **Fees / spread and a treasury account.** Real platforms take a cut, but that forces a whole design: *whose* revenue account, who may withdraw from it, how it reconciles. Parked as a post-M7 enhancement — the honest mid-market rate is the correct baseline to build on.
+- **Rate caching / TTL.** Adds staleness questions (how old is too old?) with no benefit at this scale. The seam makes it easy to add later.
+- **Keyed / commercial providers, historical rates.** Same reasoning — a swap behind the existing seam.
+- **Multi-hop conversion** (USD→EUR→JPY when a direct pair is missing). Compounds rounding error and needs a routing policy.
+- **Caller-supplied rates** (`"convert at 0.9"`). A client must never dictate the price of money — that's a trivially exploitable hole.
+- **Rate-quote-then-confirm** (lock a quote for 30s, then execute). The realistic UX for large transfers, but it needs a quote store with expiry — its own milestone.
+
+## 🔑 Milestone 4c recap — FX, end to end
+
+**No new endpoint.** The same route from 4b transparently handles conversion — the difference is detected from the two wallets' *currencies*, not from anything the client sends:
+
+| Method | Path | Gate | Behaviour |
+|---|---|---|---|
+| `POST` | `/wallets/:id/transfers` | authenticated + **ownership of source** | same currency → moves `amount` unchanged; different currencies → converts at a live rate |
+
+**The cross-currency lifecycle:**
+
+1. **Validate cheaply, outside the lock.** Reject self-transfer (`400`); confirm the caller **owns the source** (`403`/`404`); confirm the destination exists (`404`).
+2. **Read both currencies pre-lock** — immutable, so safe to trust early.
+3. **If they differ, fetch the live rate and compute the credit** with banker's rounding — still outside the transaction. Provider failure ⇒ `503`, nothing locked, nothing written. Same currency ⇒ no network call at all.
+4. **Lock both wallets in sorted-id order**, then **re-read the balances** — the only values that needed the lock. Check funds (`400`).
+5. **Debit the source by `amount`, credit the destination by the converted `credit`**, and write the linked pair with `exchangeRate` stamped on both rows (null when same-currency). One `$transaction`: all of it lands or none of it does.
+6. **Return the sender's row only.**
+
+**Interview-ready principles (new in 4c):**
+- **Slow work belongs outside the lock** — resolve everything external *before* opening the transaction, so locks are held for microseconds of local arithmetic.
+- **Immutable vs mutable decides what you may read early** — `currency` before the lock, `balance` only under it. The same rule that let M4a read `type` early.
+- **Round half-to-even for money** — half-up is biased and that bias compounds over volume; use exact decimals, never floats.
+- **Fail closed** — when the correct value is unknowable, refuse rather than guess; and fail *early*, before any state is touched.
+- **Wall off what will change** — a single-owner seam for the external call turns "swap the FX provider" into a one-file edit.
+
+**Deferred (noted, not built):** FX fees/spread + a treasury revenue account (post-M7); rate caching/TTL; keyed providers and historical rates; multi-hop conversion; quote-then-confirm; reversals/disputes; recipient lookup by email; transfer limits / velocity / fraud rules; the integration-test harness against a real test DB; pagination on wallet history; KYC gating (optional, unscheduled).
