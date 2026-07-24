@@ -4,11 +4,14 @@ import {
   ConflictException,
   ForbiddenException,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { WalletsService } from './wallets.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import type { AuthUser } from '../auth/jwt.strategy';
+import { Prisma } from '@prisma/client';
+import { RatesService } from '../rates/rates.service';
 
 const actor: AuthUser = { id: 'user-1', email: 'u1@example.com', role: 'user' };
 const other: AuthUser = { id: 'user-2', email: 'u2@example.com', role: 'user' };
@@ -16,12 +19,14 @@ const other: AuthUser = { id: 'user-2', email: 'u2@example.com', role: 'user' };
 function buildService(
   prismaMock: any,
   usersMock: any = { findByIdWithPermissions: jest.fn() },
+  ratesMock: any = { getRate: jest.fn() },
 ) {
   return Test.createTestingModule({
     providers: [
       WalletsService,
       { provide: PrismaService, useValue: prismaMock },
       { provide: UsersService, useValue: usersMock },
+      { provide: RatesService, useValue: ratesMock },
     ],
   })
     .compile()
@@ -531,17 +536,73 @@ describe('WalletsService.transfer', () => {
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
-  it('rejects a cross-currency transfer and moves no money', async () => {
+  it('converts a cross-currency transfer at the fetched rate and stamps it on both rows', async () => {
     const { txDouble, prisma } = transferPrisma({
       'wallet-2': wallet({ id: 'wallet-2', userId: 'user-2', balance: 100, currency: 'EUR' }),
     });
-    const service = await buildService(prisma);
+    const rates = { getRate: jest.fn().mockResolvedValue(new Prisma.Decimal('0.9')) };
+    const service = await buildService(prisma, undefined, rates);
+
+    await service.transfer('wallet-1', actor, { toWalletId: 'wallet-2', amount: 1000 });
+
+    // The rate was fetched with the two wallets' currencies, source -> destination.
+    expect(rates.getRate).toHaveBeenCalledWith('USD', 'EUR');
+
+    const [outRow, inRow] = txDouble.transaction.create.mock.calls.map((c: any[]) => c[0].data);
+    expect(outRow.amount).toBe(1000);          // debit, in the source currency
+    expect(inRow.amount).toBe(900);            // credit, 1000 * 0.9, in the destination currency
+    expect(outRow.exchangeRate.toString()).toBe('0.9');
+    expect(inRow.exchangeRate.toString()).toBe('0.9');
+
+    // Balances: source debited by the amount, destination credited by the converted amount.
+    expect(txDouble.wallet.update).toHaveBeenCalledWith({ where: { id: 'wallet-1' }, data: { balance: 4000 } });
+    expect(txDouble.wallet.update).toHaveBeenCalledWith({ where: { id: 'wallet-2' }, data: { balance: 1000 } });
+  });
+
+  it('rounds the credited side half-to-even (banker\'s rounding), not half-up', async () => {
+    // Ties that distinguish the two rules: 2.5 -> 2 and 4.5 -> 4 under half-to-even;
+    // half-up would give 3 and 5. amount 100 * rate lands exactly on the .5 tie.
+    const creditFor = async (rate: string) => {
+      const { txDouble, prisma } = transferPrisma({
+        'wallet-2': wallet({ id: 'wallet-2', userId: 'user-2', balance: 0, currency: 'EUR' }),
+      });
+      const rates = { getRate: jest.fn().mockResolvedValue(new Prisma.Decimal(rate)) };
+      const service = await buildService(prisma, undefined, rates);
+      await service.transfer('wallet-1', actor, { toWalletId: 'wallet-2', amount: 100 });
+      const inRow = txDouble.transaction.create.mock.calls
+        .map((c: any[]) => c[0].data)
+        .find((d: any) => d.type === 'transfer_in');
+      return inRow.amount;
+    };
+
+    expect(await creditFor('0.025')).toBe(2); // 2.5 -> 2 (even); half-up would give 3
+    expect(await creditFor('0.045')).toBe(4); // 4.5 -> 4 (even); half-up would give 5
+  });
+
+  it('fails with 503 and moves no money when the rate provider is down', async () => {
+    const { txDouble, prisma } = transferPrisma({
+      'wallet-2': wallet({ id: 'wallet-2', userId: 'user-2', balance: 100, currency: 'EUR' }),
+    });
+    const rates = { getRate: jest.fn().mockRejectedValue(new ServiceUnavailableException('down')) };
+    const service = await buildService(prisma, undefined, rates);
 
     await expect(
       service.transfer('wallet-1', actor, { toWalletId: 'wallet-2', amount: 100 }),
-    ).rejects.toThrow(BadRequestException);
-    expect(txDouble.wallet.update).not.toHaveBeenCalled();
+    ).rejects.toThrow(ServiceUnavailableException);
+
+    // Fail-closed happens BEFORE the transaction opens — nothing was locked or written.
+    expect(prisma.$transaction).not.toHaveBeenCalled();
     expect(txDouble.transaction.create).not.toHaveBeenCalled();
+  });
+
+  it('does not call the rate provider for a same-currency transfer', async () => {
+    const { prisma } = transferPrisma(); // both wallets USD
+    const rates = { getRate: jest.fn() };
+    const service = await buildService(prisma, undefined, rates);
+
+    await service.transfer('wallet-1', actor, { toWalletId: 'wallet-2', amount: 100 });
+
+    expect(rates.getRate).not.toHaveBeenCalled();
   });
 
   it('rejects a transfer larger than the sender’s balance', async () => {

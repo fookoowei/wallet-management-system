@@ -9,12 +9,15 @@ import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import type { AuthUser } from '../auth/jwt.strategy';
 import { randomUUID } from 'crypto';
+import { Prisma } from '@prisma/client';
+import { RatesService } from '../rates/rates.service';
 
 @Injectable()
 export class WalletsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly users: UsersService,
+    private readonly rates: RatesService,
   ) {}
 
   createWallet(actor: AuthUser, dto: { name: string; currency: string }) {
@@ -169,9 +172,9 @@ export class WalletsService {
   }
 
   /**
-   * Instant wallet-to-wallet transfer, same currency. Writes a linked pair of settled
-   * ledger rows (transfer_out on the sender, transfer_in on the receiver) sharing a
-   * transferId, and moves both balances inside one DB transaction.
+   * Instant wallet-to-wallet transfer. Same currency: moves `amount` unchanged (M4b). Different
+   * currencies: fetches a live rate BEFORE the transaction opens (never hold locks across an external
+   * call), converts with banker's rounding, and records the rate on both linked ledger rows.
    */
   async transfer(
     fromWalletId: string,
@@ -184,10 +187,27 @@ export class WalletsService {
       throw new BadRequestException('Cannot transfer to the same wallet');
     }
 
-    // Ownership of the SOURCE only — the destination belongs to someone else, which is
-    // the entire point of a transfer. Done before the transaction opens (M4a's lesson:
-    // no unrelated I/O while holding a lock); ownership cannot change mid-request.
-    await this.getOwnedWallet(fromWalletId, actor);
+    // Ownership of the SOURCE only, before the transaction opens. Returns the wallet (immutable
+    // currency is all we need from it here; the mutable balance is re-read under the lock).
+    const source = await this.getOwnedWallet(fromWalletId, actor);
+
+    // Destination existence + currency, read before the lock. `currency` is immutable per wallet,
+    // so reading it early is safe (same reasoning as M4a's `type`).
+    const dest = await this.prisma.wallet.findUnique({ where: { id: dto.toWalletId } });
+    if (!dest) throw new NotFoundException('Destination wallet not found');
+
+    // Fetch the rate BEFORE the lock — an external HTTP call must never run while holding two wallet
+    // locks. With `amount` (caller-supplied) and the rate both known, the entire conversion is
+    // determined here, before anything is locked. Same currency => no rate call, credit == amount.
+    let exchangeRate: Prisma.Decimal | null = null;
+    let credit = dto.amount;
+    if (source.currency !== dest.currency) {
+      exchangeRate = await this.rates.getRate(source.currency, dest.currency); // 503 on failure
+      credit = new Prisma.Decimal(dto.amount)
+        .times(exchangeRate)
+        .toDecimalPlaces(0, Prisma.Decimal.ROUND_HALF_EVEN) // banker's rounding
+        .toNumber();
+    }
 
     const transferId = randomUUID();
     // Deterministic lock order. NOT sender-then-receiver: if it were, Alice->Bob and
@@ -199,34 +219,32 @@ export class WalletsService {
       await tx.$queryRaw`SELECT id FROM "Wallet" WHERE id = ${firstLock} FOR UPDATE`;
       await tx.$queryRaw`SELECT id FROM "Wallet" WHERE id = ${secondLock} FOR UPDATE`;
 
-      // Re-read under the locks: these balances are the only ones we may trust.
+      // Re-read under the locks: only the balances are mutable and must be trusted here.
       const from = await tx.wallet.findUnique({ where: { id: fromWalletId } });
       if (!from) throw new NotFoundException('Wallet not found');
       const to = await tx.wallet.findUnique({ where: { id: dto.toWalletId } });
       if (!to) throw new NotFoundException('Destination wallet not found');
 
-      if (from.currency !== to.currency) {
-        throw new BadRequestException('Wallets must share a currency'); // conversion is M4c
-      }
       if (from.balance < dto.amount) throw new BadRequestException('Insufficient funds');
 
       const fromAfter = from.balance - dto.amount;
-      const toAfter = to.balance + dto.amount;
+      const toAfter = to.balance + credit;
       const settledAt = new Date();
 
       await tx.wallet.update({ where: { id: from.id }, data: { balance: fromAfter } });
       await tx.wallet.update({ where: { id: to.id }, data: { balance: toAfter } });
 
-      // Both halves are settled at creation and credited to the sender: they initiated
-      // the movement, and the receiver reviewed nothing.
+      // Shared across both halves. `amount` is NOT shared — each row records its OWN currency's
+      // amount (the debit on the sender, the converted credit on the receiver). `exchangeRate` is
+      // the same on both (null for a same-currency transfer).
       const shared = {
         transferId,
-        amount: dto.amount,
         status: 'approved',
         requestedBy: actor.id,
         reviewedBy: actor.id,
         reviewedAt: settledAt,
         note: dto.note,
+        exchangeRate,
       };
 
       const outRow = await tx.transaction.create({
@@ -234,6 +252,7 @@ export class WalletsService {
           ...shared,
           walletId: from.id,
           type: 'transfer_out',
+          amount: dto.amount,
           counterpartyWalletId: to.id,
           balanceBefore: from.balance,
           balanceAfter: fromAfter,
@@ -245,6 +264,7 @@ export class WalletsService {
           ...shared,
           walletId: to.id,
           type: 'transfer_in',
+          amount: credit,
           counterpartyWalletId: from.id,
           balanceBefore: to.balance,
           balanceAfter: toAfter,
