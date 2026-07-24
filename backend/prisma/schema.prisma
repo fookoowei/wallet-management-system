@@ -58,7 +58,7 @@ model Wallet {
   user         User          @relation(fields: [userId], references: [id])
   userId       String
   name         String
-  currency     String        // ISO code, e.g. "USD"; fixed per wallet (FX is M4d)
+  currency     String        // ISO code, e.g. "USD"; fixed per wallet (cross-currency handled at transfer time, M4c)
   balance      Int           @default(0) // minor units; invariant: never < 0
   transactions Transaction[]
   createdAt    DateTime      @default(now())
@@ -86,6 +86,9 @@ model Transaction {
   transferId    String?
   // Transfers only: the other wallet in the pair, so a row is self-describing without a second query.
   counterpartyWalletId String?
+  // Cross-currency transfers only: the rate applied (in.amount = round(out.amount * rate)). Null for
+  // same-currency transfers and all non-transfer rows. Recorded so the conversion is auditable/reproducible.
+  exchangeRate  Decimal?
   createdAt     DateTime  @default(now())
 
   @@index([walletId])
